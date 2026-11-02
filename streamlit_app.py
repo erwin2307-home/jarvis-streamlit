@@ -91,13 +91,32 @@ VOICE_WIDGET_HTML = r"""
     #transcript .you { color: #5fd4ff; }
     #transcript .jarvis { color: #9fe8c0; }
     #transcript div { margin: 3px 0; }
+    #talk-btn {
+      border: none; border-radius: 999px; padding: 14px 36px;
+      font-size: 15px; font-weight: 600; color: #05070c;
+      background: linear-gradient(180deg, #5fd4ff, #2b8cff);
+      box-shadow: 0 0 18px #2b8cff88, 0 2px 0 #1a4d8c inset;
+      touch-action: none; -webkit-touch-callout: none; user-select: none;
+      -webkit-user-select: none; cursor: pointer;
+    }
+    #talk-btn:active, #talk-btn.pressed {
+      background: linear-gradient(180deg, #2b8cff, #1a6fd6);
+      box-shadow: 0 0 28px #5fd4ffcc, 0 1px 0 #1a4d8c inset;
+      transform: translateY(1px);
+    }
+    #play-fallback {
+      border: 1px solid #2b8cff; border-radius: 999px; padding: 6px 18px;
+      font-size: 12px; color: #9fe8c0; background: transparent; cursor: pointer;
+    }
   </style>
   <div id="ring-wrap">
     <div id="ring-glow"></div>
     <div id="ring-core"></div>
   </div>
-  <div id="status-line">Ring anklicken, dann Leertaste halten zum Sprechen</div>
+  <button id="talk-btn" type="button">🎤 Gedrückt halten zum Sprechen</button>
+  <div id="status-line">Button oder Leertaste (Ring anklicken) halten zum Sprechen</div>
   <div id="hint-line"></div>
+  <button id="play-fallback" type="button" style="display:none;">▶️ Antwort abspielen</button>
   <div id="transcript"></div>
 
   <script>
@@ -107,17 +126,20 @@ VOICE_WIDGET_HTML = r"""
     const root = document.getElementById("jarvis-root");
     const statusLine = document.getElementById("status-line");
     const transcriptEl = document.getElementById("transcript");
+    const talkBtn = document.getElementById("talk-btn");
+    const playFallback = document.getElementById("play-fallback");
 
     let mediaStream = null;
     let recorder = null;
     let chunks = [];
     let spaceDown = false;
+    let isActive = false; // guards against button + spacebar double-triggering
 
     function setState(state) {
       root.classList.remove("listening", "thinking", "speaking");
       if (state) root.classList.add(state);
       const labels = {
-        idle: "Leertaste halten zum Sprechen",
+        idle: "Button oder Leertaste (Ring anklicken) halten zum Sprechen",
         listening: "Höre zu…",
         thinking: "Denke…",
         speaking: "Spreche…",
@@ -182,6 +204,7 @@ VOICE_WIDGET_HTML = r"""
     }
 
     async function startRecording() {
+      if (isActive) return; // already recording (button+space overlap) — ignore
       if (!API_URL || !API_KEY) {
         statusLine.textContent = "API-URL/API-Key fehlen (Sidebar ausfüllen)";
         return;
@@ -192,6 +215,9 @@ VOICE_WIDGET_HTML = r"""
         statusLine.textContent = "Mikrofon-Zugriff verweigert: " + e;
         return;
       }
+      isActive = true;
+      talkBtn.classList.add("pressed");
+      playFallback.style.display = "none";
       chunks = [];
       recorder = new MediaRecorder(mediaStream);
       recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
@@ -200,6 +226,9 @@ VOICE_WIDGET_HTML = r"""
     }
 
     function stopRecordingAndSend() {
+      if (!isActive) return;
+      isActive = false;
+      talkBtn.classList.remove("pressed");
       if (!recorder || recorder.state === "inactive") return;
       recorder.onstop = async () => {
         setState("thinking");
@@ -234,7 +263,18 @@ VOICE_WIDGET_HTML = r"""
             const audio = new Audio("data:audio/wav;base64," + body.audio_base64);
             audio.onended = () => setState("idle");
             audio.onerror = () => setState("idle");
-            audio.play().catch(() => setState("idle"));
+            audio.play().catch(() => {
+              // iOS can block autoplay here if too much time passed since
+              // the last user gesture (the recording tap) — offer a
+              // one-tap fallback, which is itself a fresh gesture.
+              setState("idle");
+              playFallback.style.display = "inline-block";
+              playFallback.onclick = () => {
+                playFallback.style.display = "none";
+                setState("speaking");
+                audio.play().catch(() => setState("idle"));
+              };
+            });
           } else {
             setState("idle");
           }
@@ -261,6 +301,28 @@ VOICE_WIDGET_HTML = r"""
       }
     });
     root.addEventListener("click", () => root.focus());
+
+    // Button: works for mouse (PC) and touch (iPhone/mobile) via Pointer
+    // Events. Additive to spacebar, not a replacement — isActive guards
+    // against both firing at once.
+    talkBtn.addEventListener("pointerdown", (e) => {
+      e.preventDefault();
+      startRecording();
+    });
+    talkBtn.addEventListener("pointerup", (e) => {
+      e.preventDefault();
+      stopRecordingAndSend();
+    });
+    talkBtn.addEventListener("pointercancel", (e) => {
+      e.preventDefault();
+      stopRecordingAndSend();
+    });
+    talkBtn.addEventListener("pointerleave", (e) => {
+      if (isActive) stopRecordingAndSend();
+    });
+    // Prevent context menu / long-press callout from interrupting on mobile.
+    talkBtn.addEventListener("contextmenu", (e) => e.preventDefault());
+
     setState("idle");
   })();
   </script>
