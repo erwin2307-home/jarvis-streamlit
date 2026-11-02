@@ -82,12 +82,22 @@ if ($ollamaUp) {
 }
 
 # --- 2) Remote chat API in its own window ---
+# Wrapped in a restart loop: this window is the only thing keeping the API
+# alive (it's a plain console process, not a service), so a crash — or the
+# "low memory, background task killed" situation seen earlier with the 32b
+# model pull — would otherwise silently take the whole remote setup down
+# until someone notices and manually restarts this script.
 $apiCmd = @"
 `$env:JARVIS_REMOTE_API_KEY='$ApiKey'
 Set-Location '$BackendDir'
-& '$UvBin' run uvicorn jarvis.remote_api:app --host 0.0.0.0 --port 8800
+while (`$true) {
+  & '$UvBin' run uvicorn jarvis.remote_api:app --host 0.0.0.0 --port 8800
+  Write-Host ''
+  Write-Host 'remote API exited - restarting in 3s (Ctrl+C to stop for good)' -ForegroundColor Yellow
+  Start-Sleep -Seconds 3
+}
 "@
-Write-Host "starting remote chat API (uvicorn on :8800)..."
+Write-Host "starting remote chat API (uvicorn on :8800, auto-restarts on crash)..."
 Start-Process -FilePath "powershell.exe" -ArgumentList "-NoExit", "-Command", $apiCmd
 
 Write-Host "waiting for remote API health..." -NoNewline
@@ -109,12 +119,23 @@ if (-not $apiUp) {
 Write-Host "ok: remote API ready on :8800" -ForegroundColor Green
 
 # --- 3) Cloudflare quick tunnel ---
+# Also auto-restarts on crash. Note: a restart gets a NEW random
+# trycloudflare.com URL (inherent to the free quick-tunnel mode — there's
+# no fixed hostname without a Cloudflare account + a named tunnel), so if
+# the tunnel itself dies mid-session the already-pasted Streamlit secret
+# goes stale; the API surviving a crash (above) is the common case this
+# actually fixes. tail the log (type "$TunnelLog") if things stop working
+# and the printed URL below no longer responds.
 $TunnelLog = Join-Path $env:TEMP "jarvis-cloudflared.log"
-$TunnelOutLog = Join-Path $env:TEMP "jarvis-cloudflared.out.log"
-Remove-Item $TunnelLog, $TunnelOutLog -ErrorAction SilentlyContinue
-Write-Host "starting cloudflare tunnel..."
-Start-Process -FilePath $CloudflaredBin -ArgumentList "tunnel", "--url", "http://localhost:8800" `
-  -WindowStyle Hidden -RedirectStandardError $TunnelLog -RedirectStandardOutput $TunnelOutLog
+Remove-Item $TunnelLog -ErrorAction SilentlyContinue
+Write-Host "starting cloudflare tunnel (auto-restarts on crash)..."
+$tunnelCmd = @"
+while (`$true) {
+  & '$CloudflaredBin' tunnel --url http://localhost:8800 *>> '$TunnelLog'
+  Start-Sleep -Seconds 3
+}
+"@
+Start-Process -FilePath "powershell.exe" -ArgumentList "-WindowStyle", "Hidden", "-Command", $tunnelCmd -WindowStyle Hidden
 
 Write-Host "waiting for tunnel URL..." -NoNewline
 $deadline = (Get-Date).AddSeconds(30)
@@ -134,15 +155,19 @@ if (-not $TunnelUrl) {
   exit 3
 }
 
-try { Set-Clipboard -Value $TunnelUrl } catch { }
+$SecretsBlock = "API_URL = `"$TunnelUrl`"`nAPI_KEY = `"$ApiKey`""
+try { Set-Clipboard -Value $SecretsBlock } catch { }
 
 Write-Host ""
-Write-Host "=== Jarvis Remote ist bereit ===" -ForegroundColor Cyan
-Write-Host "Tunnel-URL (in Zwischenablage kopiert): $TunnelUrl" -ForegroundColor Green
-Write-Host "API-Key: $ApiKey"
+Write-Host "=== Jeanny Remote ist bereit ===" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "In der Streamlit-App (Sidebar) eintragen:"
-Write-Host "  API-URL = $TunnelUrl"
-Write-Host "  API-Key = $ApiKey"
+Write-Host "Secrets (bereits in der Zwischenablage - direkt einfuegen):" -ForegroundColor Green
+Write-Host "-----------------------------------------------------------"
+Write-Host $SecretsBlock
+Write-Host "-----------------------------------------------------------"
 Write-Host ""
-Write-Host "Fenster offen lassen, solange die Streamlit-App erreichbar sein soll."
+Write-Host "-> Streamlit Cloud: App -> Settings -> Secrets -> einfuegen -> Save"
+Write-Host "-> Oder direkt in der App-Sidebar bei API-URL / API-Key einfuegen"
+Write-Host ""
+Write-Host "Fenster offen lassen, solange die App erreichbar sein soll."
+Write-Host "(API und Tunnel starten bei einem Absturz jetzt automatisch neu.)" -ForegroundColor DarkGray
