@@ -20,6 +20,7 @@ import numpy as np
 import numpy.typing as npt
 import soundfile as sf  # type: ignore[import-untyped]
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 from pydantic import BaseModel
 
@@ -47,6 +48,19 @@ if not settings.remote_api_key:
     )
 
 app = FastAPI(title="Jarvis Remote Chat API", version=__version__)
+
+# The Streamlit Cloud frontend (its own origin) calls this API's tunnel
+# URL directly from the browser — a cross-origin request, so the browser
+# sends an OPTIONS preflight before the real POST. Auth is via the
+# X-API-Key header (not cookies), so a wildcard origin without credentials
+# is fine here; the API key is still the real gate on every request.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def _build_llm() -> Llm:

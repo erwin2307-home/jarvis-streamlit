@@ -61,6 +61,23 @@ def test_chat_rejects_empty_message(client):
     assert resp.status_code == 400
 
 
+def test_voice_options_preflight_is_allowed(client):
+    # Streamlit Cloud serves a different origin than the tunnel URL, so the
+    # browser sends a CORS preflight (OPTIONS) before the real POST /voice.
+    # Without CORSMiddleware this 405s and the browser never sends the real
+    # request — this reproduces that failure.
+    resp = client.options(
+        "/voice",
+        headers={
+            "Origin": "https://example.streamlit.app",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "x-api-key",
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.headers.get("access-control-allow-origin") == "*"
+
+
 def test_voice_requires_api_key(client, fixtures_dir):
     wav_bytes = (fixtures_dir / "sine_440.wav").read_bytes()
     resp = client.post("/voice", files={"audio": ("rec.wav", wav_bytes, "audio/wav")})
