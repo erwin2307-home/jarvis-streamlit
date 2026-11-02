@@ -252,3 +252,115 @@ def test_voice_timer_with_duration_sets_timer_seconds_without_llm(client, fixtur
     body = resp.json()
     assert "TRAP" not in body["reply"]
     assert body["timer_seconds"] == 120
+
+
+def test_chat_beadchip_exact_match_bypasses_llm(client):
+    from jarvis.llm import FakeLlm
+    from jarvis.qa_beadchip import BEADCHIP_QA
+    from jarvis.qa_lookup import best_match
+
+    client.app.state.llm = FakeLlm(["TRAP: should never be used"])
+    resp = client.post(
+        "/chat",
+        json={"message": "was ist ein illumina beadchip chip"},
+        headers={"X-API-Key": "test-secret"},
+    )
+    assert resp.status_code == 200
+    reply = resp.json()["reply"]
+    assert "TRAP" not in reply
+    assert reply == best_match("was ist ein illumina beadchip chip", BEADCHIP_QA)
+
+
+def test_chat_bare_reagent_abbreviation_bypasses_llm(client):
+    from jarvis.llm import FakeLlm
+    from jarvis.qa_beadchip import reagent_answer
+
+    client.app.state.llm = FakeLlm(["TRAP: should never be used"])
+    resp = client.post(
+        "/chat", json={"message": "ra1"}, headers={"X-API-Key": "test-secret"}
+    )
+    assert resp.status_code == 200
+    reply = resp.json()["reply"]
+    assert "TRAP" not in reply
+    assert reply == reagent_answer("ra1")
+
+
+def test_chat_loose_beadchip_question_injects_context_for_llm(client):
+    from jarvis.llm import LlmEvent
+
+    captured_messages = []
+
+    class CapturingLlm:
+        async def chat(self, messages):
+            captured_messages.append(messages)
+            yield LlmEvent(kind="done", text="synthesized answer")
+
+    client.app.state.llm = CapturingLlm()
+    resp = client.post(
+        "/chat",
+        json={"message": "erzähl mir was über den beadchip workflow allgemein"},
+        headers={"X-API-Key": "test-secret"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["reply"] == "synthesized answer"
+    assert len(captured_messages) == 1
+    system_texts = [m["content"] for m in captured_messages[0] if m.get("role") == "system"]
+    assert any("BeadChip" in t for t in system_texts)
+
+
+def test_chat_unrelated_question_gets_no_beadchip_context(client):
+    from jarvis.llm import LlmEvent
+
+    captured_messages = []
+
+    class CapturingLlm:
+        async def chat(self, messages):
+            captured_messages.append(messages)
+            yield LlmEvent(kind="done", text="ok")
+
+    client.app.state.llm = CapturingLlm()
+    resp = client.post(
+        "/chat", json={"message": "wie geht es dir"}, headers={"X-API-Key": "test-secret"}
+    )
+    assert resp.status_code == 200
+    system_texts = [m["content"] for m in captured_messages[0] if m.get("role") == "system"]
+    assert not any("BeadChip" in t for t in system_texts)
+
+
+def test_voice_beadchip_exact_match_bypasses_llm(client, fixtures_dir):
+    from jarvis.llm import FakeLlm
+    from jarvis.qa_beadchip import BEADCHIP_QA
+    from jarvis.qa_lookup import best_match
+    from jarvis.stt import FakeStt
+
+    client.app.state.stt = FakeStt(text="was ist ein illumina beadchip chip")
+    client.app.state.llm = FakeLlm(["TRAP: should never be used"])
+    wav_bytes = (fixtures_dir / "sine_440.wav").read_bytes()
+    resp = client.post(
+        "/voice",
+        files={"audio": ("rec.wav", wav_bytes, "audio/wav")},
+        headers={"X-API-Key": "test-secret"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "TRAP" not in body["reply"]
+    assert body["reply"] == best_match("was ist ein illumina beadchip chip", BEADCHIP_QA)
+
+
+def test_voice_bare_reagent_abbreviation_bypasses_llm(client, fixtures_dir):
+    from jarvis.llm import FakeLlm
+    from jarvis.qa_beadchip import reagent_answer
+    from jarvis.stt import FakeStt
+
+    client.app.state.stt = FakeStt(text="ra1")
+    client.app.state.llm = FakeLlm(["TRAP: should never be used"])
+    wav_bytes = (fixtures_dir / "sine_440.wav").read_bytes()
+    resp = client.post(
+        "/voice",
+        files={"audio": ("rec.wav", wav_bytes, "audio/wav")},
+        headers={"X-API-Key": "test-secret"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "TRAP" not in body["reply"]
+    assert body["reply"] == reagent_answer("ra1")

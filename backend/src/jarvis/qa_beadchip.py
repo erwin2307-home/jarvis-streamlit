@@ -60,6 +60,135 @@ _FULL_WORKFLOW_24_ANSWER = (
     "Prozent liegen."
 )
 
+
+# ── Per-reagent dedicated answers ───────────────────────────────────────
+#
+# qa_lookup.best_match() requires at least 2 shared keywords
+# (min_overlap=2) to avoid false positives — so a bare query like "ra1"
+# or "was ist ra1" (1 real content word after stopword-stripping) never
+# clears that bar against the "was ist ra1 reagenz" entry above, and
+# would otherwise fall through to the broad topic_context RAG injection,
+# where the LLM might bury or skip the specific fact asked for. This is
+# a dedicated, higher-reliability path: detect *which* reagent was named
+# via word-boundary matching and answer about exactly that one, leading
+# with where it's actually used in the workflow — for RA1 specifically,
+# that means leading with "this is applied when the sample goes onto the
+# chip" per the explicit request, not buried after other details.
+#
+# Sourced from ~/Desktop/Illumina_BeadChip_Referenz/01_Reagenzien_und_
+# Chemikalien.md and 02_Extend_and_Stain_Verfahren.md (Illumina Infinium
+# LCG/HD Assay Guides) plus the already-researched _ALL_REAGENTS_ANSWER /
+# _FULL_WORKFLOW_24_ANSWER step ordering above for reagents not detailed
+# in those two files (MSM, PB2, XC1, XC2, TEM, STM — different kit
+# naming convention, HD/HTS rather than LCG; both appear in real
+# Illumina docs depending on assay version).
+_REAGENT_ANSWERS: dict[str, str] = {
+    "ra1": (
+        "RA1 wird gebraucht, wenn die Probe auf den BeadChip aufgetragen "
+        "wird — es ist das Hybridisierungs-Reagenz, in dem die DNA "
+        "während der Hybridisierung auf dem Chip liegt. Direkt davor "
+        "wird die Probe auch im Resuspensions-Schritt in RA1 aufgenommen. "
+        "RA1 kann Kristalle oder Präzipitat bilden — vor jeder Nutzung "
+        "prüfen und durch Invertieren wieder auflösen. Mengen: 10 ml für "
+        "1–8 Chips, 20 ml für 9–16, 30 ml für 17–24."
+    ),
+    "ma1": (
+        "MA1 wird im Amplifikations-Schritt (MSA3) zusammen mit der "
+        "DNA-Probe in jedes Well gegeben — eines der ersten Reagenzien "
+        "im Workflow, lange vor dem Auftragen der Probe auf den Chip."
+    ),
+    "ma2": (
+        "MA2 wird im Amplifikations-Schritt (MSA3) nach der "
+        "Natriumhydroxid-Behandlung zugegeben, zusammen mit MA1 Teil der "
+        "frühen Amplifikationsphase — vor dem Auftragen auf den Chip."
+    ),
+    "msm": (
+        "MSM wird wie MA1 und MA2 im Amplifikations-Schritt eingesetzt — "
+        "noch vor Fragmentierung, Präzipitation und dem Auftragen der "
+        "Probe auf den Chip."
+    ),
+    "fms": (
+        "FMS (Fragmentation Solution) wird im Fragmentierungs-Schritt "
+        "eingesetzt, um die amplifizierte DNA enzymatisch in kleinere "
+        "Stücke zu zerlegen — nach der Amplifikation, vor dem Auftragen "
+        "auf den Chip."
+    ),
+    "pm1": (
+        "PM1 wird im Präzipitations-Schritt zusammen mit Isopropanol "
+        "verwendet, um die amplifizierte und fragmentierte DNA "
+        "auszufällen — noch vor der Resuspension in RA1 und dem "
+        "Auftragen auf den Chip."
+    ),
+    "lx1": (
+        "LX1 ist eine Hybridisierungspuffer-Komponente im "
+        "Extend-and-Stain-Schritt (XStain) — ein Röhrchen pro vier "
+        "BeadChips, vor Gebrauch zum Mischen invertieren."
+    ),
+    "lx2": (
+        "LX2 ist wie LX1 eine Hybridisierungspuffer-Komponente im "
+        "Extend-and-Stain-Schritt — ein Röhrchen pro vier BeadChips, "
+        "vor Gebrauch invertieren."
+    ),
+    "pb1": (
+        "PB1 ist die erste Waschlösung nach der Chamber-Demontage — "
+        "310 ml für 1–8 Chips, 285 ml für 9–24. Freie Zirkulation "
+        "zwischen den BeadChips ist wichtig, um Hintergrund-Staining zu "
+        "reduzieren."
+    ),
+    "pb2": (
+        "PB2 kommt während der Hybridisierung zum Einsatz — es kommt in "
+        "die Feuchtigkeitsreservoirs, genau dann, wenn die Probe auf den "
+        "Chip aufgetragen wird."
+    ),
+    "xc1": (
+        "XC1 wird im Staining-Schritt eingesetzt, direkt nach RA1 und "
+        "vor XC2 — also nach dem Auftragen der Probe auf den Chip."
+    ),
+    "xc2": (
+        "XC2 wird im Staining-Schritt eingesetzt, direkt nach XC1 und "
+        "vor TEM."
+    ),
+    "xc3": (
+        "XC3 ist die Waschlösung im zweiten Waschschritt — 50 ml für "
+        "1–8 Chips, 100 ml für 9–16, 150 ml für 17–24."
+    ),
+    "xc4": (
+        "XC4 ist die resuspendierte Beschichtungslösung im zweiten "
+        "Waschschritt — vor Gebrauch kräftig resuspendieren (ggf. "
+        "vortexen) und danach nicht länger als 10 Minuten stehen lassen. "
+        "Die Beschichtung macht den Chip rutschig — selbstschließende "
+        "Pinzette benutzen."
+    ),
+    "tem": (
+        "TEM wird im Staining-Schritt eingesetzt, nach XC1/XC2 und vor "
+        "der Formamid-EDTA-Mischung."
+    ),
+    "stm": (
+        "STM wird im Staining-Schritt abwechselnd mit ATM eingesetzt, "
+        "nach der Formamid-EDTA-Mischung und vor XC3."
+    ),
+    "atm": (
+        "ATM wird im Staining-Schritt abwechselnd mit STM eingesetzt — "
+        "ein Röhrchen pro vier BeadChips, vor Gebrauch invertieren."
+    ),
+}
+
+_REAGENT_PATTERN_EARLY = re.compile(
+    r"\b(?:" + "|".join(_REAGENT_ANSWERS) + r")\b", re.IGNORECASE
+)
+
+
+def reagent_answer(text: str) -> str | None:
+    """Dedicated answer for a bare reagent-abbreviation mention (e.g. a
+    standalone "RA1" or "was ist RA1"), bypassing best_match()'s
+    min_overlap requirement. Returns the first reagent found, or None if
+    none of the known abbreviations appear."""
+    m = _REAGENT_PATTERN_EARLY.search(text)
+    if not m:
+        return None
+    return _REAGENT_ANSWERS[m.group(0).lower()]
+
+
 BEADCHIP_QA: tuple[QaEntry, ...] = (
     make_entry(
         "was ist ein illumina beadchip chip",
@@ -128,9 +257,7 @@ BEADCHIP_QA: tuple[QaEntry, ...] = (
     ),
     make_entry(
         "was ist ra1 reagenz",
-        "RA1 ist ein Resuspensions- und Hybridisierungs-Reagenz im "
-        "Infinium-Workflow. Es kann Kristalle bilden — vor Gebrauch "
-        "muss man es prüfen und durch Invertieren wieder auflösen.",
+        _REAGENT_ANSWERS["ra1"],
     ),
     make_entry(
         "wie viele proben chips kann man pro woche verarbeiten durchsatz",

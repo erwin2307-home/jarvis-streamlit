@@ -3,10 +3,12 @@ internet (ngrok/cloudflared) so a Streamlit Cloud frontend can reach this
 machine's LLM.
 
 Deliberately separate from app.py's voice-pipeline FastAPI app: this one
-exposes ONLY plain chat (HybridLlm, same routing/time-injection as the
-voice path). No coding_handler (auto-runs generated scripts — would be
-remote code execution if exposed to the internet), no qa_matcher, no
-WebSocket, no mic/speaker/wake/VAD/STT/TTS.
+exposes plain chat (HybridLlm, same routing/time-injection as the voice
+path) plus the BeadChip QA fast-path (qa_beadchip.py — exact-match
+answers + reagent lookup + broad topic-context injection for the LLM).
+No coding_handler (auto-runs generated scripts — would be remote code
+execution if exposed to the internet), no WebSocket, no mic/speaker/
+wake/VAD/STT/TTS.
 
 Run: uv run uvicorn jarvis.remote_api:app --host 0.0.0.0 --port 8800
 """
@@ -37,6 +39,8 @@ from jarvis.llm import (
     load_groq_key,
     select_cloud_provider,
 )
+from jarvis.qa_beadchip import BEADCHIP_QA, beadchip_topic_context, reagent_answer
+from jarvis.qa_lookup import best_match
 from jarvis.stt import RealStt, Stt
 from jarvis.tts import EdgeTts, RealTts, Tts
 
@@ -255,6 +259,13 @@ def _check_key(x_api_key: str | None) -> None:
         raise HTTPException(status_code=401, detail="invalid or missing X-API-Key")
 
 
+def beadchip_fastpath_answer(text: str) -> str | None:
+    """Exact-match (curated question) or bare-reagent-abbreviation
+    BeadChip answer — checked before the LLM; a hit skips model
+    inference entirely, same reasoning as is_time_query/is_timer_query."""
+    return best_match(text, BEADCHIP_QA) or reagent_answer(text)
+
+
 @app.get("/health")
 async def health() -> dict[str, object]:
     return {"ok": True, "version": __version__}
@@ -275,9 +286,16 @@ async def chat(
         secs = parse_timer_seconds(req.message)
         return ChatResponse(reply=timer_reply(secs), timer_seconds=secs)
 
-    messages = [*req.history, {"role": "user", "content": req.message}]
-    llm: Llm = app.state.llm
+    beadchip_answer = beadchip_fastpath_answer(req.message)
+    if beadchip_answer is not None:
+        return ChatResponse(reply=beadchip_answer)
 
+    messages = [*req.history, {"role": "user", "content": req.message}]
+    topic_context = beadchip_topic_context(req.message)
+    if topic_context:
+        messages = [{"role": "system", "content": topic_context}, *messages]
+
+    llm: Llm = app.state.llm
     full = ""
     try:
         async for ev in llm.chat(messages):
@@ -319,16 +337,24 @@ async def voice(
         raise HTTPException(status_code=400, detail="no speech recognized")
 
     timer_seconds: int | None = None
+    beadchip_answer = beadchip_fastpath_answer(transcript)
     if is_time_query(transcript):
         full = time_answer()
     elif is_timer_query(transcript):
         timer_seconds = parse_timer_seconds(transcript)
         full = timer_reply(timer_seconds)
+    elif beadchip_answer is not None:
+        full = beadchip_answer
     else:
+        messages = [{"role": "user", "content": transcript}]
+        topic_context = beadchip_topic_context(transcript)
+        if topic_context:
+            messages = [{"role": "system", "content": topic_context}, *messages]
+
         llm: Llm = app.state.llm
         full = ""
         try:
-            async for ev in llm.chat([{"role": "user", "content": transcript}]):
+            async for ev in llm.chat(messages):
                 if ev.kind == "chunk":
                     full += ev.text
                 elif ev.kind == "done":
