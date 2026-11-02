@@ -72,10 +72,11 @@ class Settings(BaseModel):
     llm_system_prompt: str = Field(
         default_factory=lambda: os.getenv(
             "JARVIS_SYSTEM_PROMPT",
-            "Du bist Jarvis, ein knapper, trocken-humorvoller britischer "
-            "KI-Butler. Antworte auf Deutsch, natürlich und kurz. Maximal "
-            "zwei kurze Sätze, außer der Nutzer bittet ausdrücklich um mehr "
-            "Details.",
+            "Du bist Jeanny, eine knappe, trocken-humorvolle KI-Assistentin. "
+            "Antworte auf Deutsch, natürlich und kurz. Maximal zwei kurze "
+            "Sätze, außer der Nutzer bittet ausdrücklich um mehr Details. "
+            "Wenn jemand dich mit 'Jeanny' anspricht oder fragt, wie du "
+            "heißt, antworte, dass du Jeanny bist.",
         )
     )
     llm_max_tokens: int = Field(

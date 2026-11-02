@@ -1,4 +1,4 @@
-"""Thin Streamlit chat+voice frontend for Jarvis.
+"""Thin Streamlit chat+voice frontend for Jeanny.
 
 Deployed to Streamlit Community Cloud. Talks to the real LLM (and STT/TTS)
 running on your own machine (jarvis/backend/src/jarvis/remote_api.py) over
@@ -20,7 +20,7 @@ import requests
 import streamlit as st
 import streamlit.components.v1 as components
 
-st.set_page_config(page_title="Jarvis", page_icon="🤖")
+st.set_page_config(page_title="Jeanny", page_icon="🤖")
 
 
 def _default(key: str, fallback: str = "") -> str:
@@ -146,12 +146,34 @@ VOICE_WIDGET_HTML = r"""
     const playFallback = document.getElementById("play-fallback");
     const timersEl = document.getElementById("timers");
 
-    const ANIMAL_SOUNDS = [
-      "https://upload.wikimedia.org/wikipedia/commons/c/c5/Rooster_crowing.ogg",
-      "https://upload.wikimedia.org/wikipedia/commons/5/58/Barking_of_a_dog_2.ogg",
-      "https://upload.wikimedia.org/wikipedia/commons/0/0c/Meow_domestic_cat.ogg",
-      "https://upload.wikimedia.org/wikipedia/commons/4/48/Mudchute_cow_1.ogg",
+    // Real animal recordings (verified Wikimedia Commons .ogg files) mixed
+    // with speech-synthesized meme alarm lines — using the browser's own
+    // SpeechSynthesis API for the latter sidesteps hunting for sketchy,
+    // unlicensed meme audio: it says exactly the requested line, with no
+    // licensing/hosting risk at all.
+    const ALARMS = [
+      { type: "audio", url: "https://upload.wikimedia.org/wikipedia/commons/c/c5/Rooster_crowing.ogg" },
+      { type: "audio", url: "https://upload.wikimedia.org/wikipedia/commons/5/58/Barking_of_a_dog_2.ogg" },
+      { type: "audio", url: "https://upload.wikimedia.org/wikipedia/commons/0/0c/Meow_domestic_cat.ogg" },
+      { type: "audio", url: "https://upload.wikimedia.org/wikipedia/commons/4/48/Mudchute_cow_1.ogg" },
+      { type: "speech", text: "Achtung, Achtung! Zombie-Ausbruch gemeldet!", lang: "de-DE" },
+      { type: "speech", text: "Warnung! Der Weltuntergang steht unmittelbar bevor!", lang: "de-DE" },
+      { type: "speech", text: "Atomic missile will arrive in 3, 2, 1.", lang: "en-US" },
     ];
+
+    function playRandomAlarm() {
+      const alarm = ALARMS[Math.floor(Math.random() * ALARMS.length)];
+      if (alarm.type === "audio") {
+        new Audio(alarm.url).play().catch(() => {});
+      } else if (window.speechSynthesis) {
+        try {
+          const utter = new SpeechSynthesisUtterance(alarm.text);
+          utter.lang = alarm.lang;
+          utter.rate = 0.95;
+          window.speechSynthesis.speak(utter);
+        } catch (e) { /* speech synthesis unavailable — skip silently */ }
+      }
+    }
 
     let timers = []; // {id, remaining}
     let timerIdSeq = 0;
@@ -178,11 +200,6 @@ VOICE_WIDGET_HTML = r"""
       renderTimers();
     }
 
-    function playRandomAnimal() {
-      const url = ANIMAL_SOUNDS[Math.floor(Math.random() * ANIMAL_SOUNDS.length)];
-      new Audio(url).play().catch(() => {});
-    }
-
     setInterval(() => {
       if (timers.length === 0) return;
       const fired = [];
@@ -191,7 +208,7 @@ VOICE_WIDGET_HTML = r"""
         if (t.remaining <= 0) fired.push(t.id);
       });
       if (fired.length > 0) {
-        fired.forEach(() => playRandomAnimal());
+        fired.forEach(() => playRandomAlarm());
         timers = timers.filter((t) => !fired.includes(t.id));
       }
       renderTimers();
@@ -218,7 +235,7 @@ VOICE_WIDGET_HTML = r"""
     function addLine(cls, text) {
       const div = document.createElement("div");
       div.className = cls;
-      div.textContent = (cls === "you" ? "Du: " : "Jarvis: ") + text;
+      div.textContent = (cls === "you" ? "Du: " : "Jeanny: ") + text;
       transcriptEl.appendChild(div);
       transcriptEl.scrollTop = transcriptEl.scrollHeight;
     }
@@ -427,7 +444,7 @@ with st.sidebar:
         st.session_state["messages"] = []
         st.rerun()
 
-st.title("🤖 Jarvis")
+st.title("🤖 Jeanny")
 
 render_voice_widget(api_url, api_key)
 
@@ -443,7 +460,7 @@ for msg in st.session_state["messages"]:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-prompt = st.chat_input("…oder Nachricht an Jarvis tippen")
+prompt = st.chat_input("…oder Nachricht an Jeanny tippen")
 
 if prompt:
     if not api_url or not api_key:
@@ -455,7 +472,7 @@ if prompt:
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        with st.spinner("Jarvis denkt…"):
+        with st.spinner("Jeanny denkt…"):
             try:
                 resp = requests.post(
                     f"{api_url.rstrip('/')}/chat",
