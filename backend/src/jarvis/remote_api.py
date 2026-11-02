@@ -12,7 +12,14 @@ Run: uv run uvicorn jarvis.remote_api:app --host 0.0.0.0 --port 8800
 """
 from __future__ import annotations
 
-from fastapi import FastAPI, Header, HTTPException
+import base64
+import io
+from fractions import Fraction
+
+import numpy as np
+import numpy.typing as npt
+import soundfile as sf  # type: ignore[import-untyped]
+from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 from loguru import logger
 from pydantic import BaseModel
 
@@ -27,6 +34,8 @@ from jarvis.llm import (
     load_groq_key,
     select_cloud_provider,
 )
+from jarvis.stt import RealStt, Stt
+from jarvis.tts import EdgeTts, RealTts, Tts
 
 settings = get_settings()
 
@@ -83,7 +92,53 @@ def _build_llm() -> Llm:
     )
 
 
+def _build_stt() -> Stt:
+    return RealStt(
+        model_name=settings.whisper_model,
+        compute_type=settings.whisper_compute,
+        language=settings.whisper_lang,
+        initial_prompt=settings.whisper_initial_prompt,
+    )
+
+
+def _build_tts() -> Tts:
+    if settings.tts_backend == "piper":
+        return RealTts(
+            model_path=settings.tts_model_path, length_scale=settings.tts_length_scale
+        )
+    return EdgeTts(voice=settings.tts_edge_voice)
+
+
 app.state.llm = _build_llm()
+app.state.stt = _build_stt()
+app.state.tts = _build_tts()
+
+
+def _decode_wav_to_pcm16(raw: bytes, target_sr: int) -> npt.NDArray[np.int16]:
+    """Decode uploaded WAV bytes to mono int16 PCM at target_sr (Whisper's
+    expected rate). Browsers/Streamlit's audio widget may hand us a
+    different rate than configured, so resample defensively."""
+    raw_data, sr = sf.read(io.BytesIO(raw), dtype="int16")
+    data: npt.NDArray[np.int16] = np.asarray(raw_data, dtype=np.int16)
+    if data.ndim > 1:
+        data = data.mean(axis=1).astype(np.int16)
+    if sr != target_sr:
+        frac = Fraction(target_sr, sr).limit_denominator(1000)
+        from scipy.signal import resample_poly  # type: ignore[import-untyped]
+
+        resampled = resample_poly(data.astype(np.float32), frac.numerator, frac.denominator)
+        data = np.clip(resampled, -32768, 32767).astype(np.int16)
+    return data
+
+
+async def _synthesize_wav(tts: Tts, text: str) -> bytes:
+    chunks: list[npt.NDArray[np.float32]] = []
+    async for chunk in tts.synthesize(text):
+        chunks.append(chunk)
+    audio = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
+    buf = io.BytesIO()
+    sf.write(buf, audio, settings.tts_sample_rate, format="WAV", subtype="PCM_16")
+    return buf.getvalue()
 
 
 class ChatRequest(BaseModel):
@@ -128,3 +183,55 @@ async def chat(
         raise HTTPException(status_code=502, detail="LLM backend failed") from exc
 
     return ChatResponse(reply=full)
+
+
+class VoiceResponse(BaseModel):
+    transcript: str
+    reply: str
+    audio_base64: str
+    sample_rate: int
+
+
+@app.post("/voice", response_model=VoiceResponse)
+async def voice(
+    audio: UploadFile = File(...), x_api_key: str | None = Header(default=None)
+) -> VoiceResponse:
+    _check_key(x_api_key)
+
+    raw = await audio.read()
+    try:
+        pcm = _decode_wav_to_pcm16(raw, settings.sample_rate)
+    except Exception as exc:
+        logger.warning(f"remote_api: failed to decode uploaded audio: {exc!r}")
+        raise HTTPException(status_code=400, detail="could not decode audio") from exc
+
+    stt: Stt = app.state.stt
+    transcript = (await stt.transcribe(pcm)).strip()
+    if not transcript:
+        raise HTTPException(status_code=400, detail="no speech recognized")
+
+    llm: Llm = app.state.llm
+    full = ""
+    try:
+        async for ev in llm.chat([{"role": "user", "content": transcript}]):
+            if ev.kind == "chunk":
+                full += ev.text
+            elif ev.kind == "done":
+                full = ev.text or full
+    except Exception as exc:
+        logger.error(f"remote_api: chat failed: {exc!r}")
+        raise HTTPException(status_code=502, detail="LLM backend failed") from exc
+
+    tts: Tts = app.state.tts
+    try:
+        wav_bytes = await _synthesize_wav(tts, full)
+    except Exception as exc:
+        logger.warning(f"remote_api: TTS failed (replying text-only): {exc!r}")
+        wav_bytes = b""
+
+    return VoiceResponse(
+        transcript=transcript,
+        reply=full,
+        audio_base64=base64.b64encode(wav_bytes).decode("ascii"),
+        sample_rate=settings.tts_sample_rate,
+    )
