@@ -364,3 +364,54 @@ def test_voice_bare_reagent_abbreviation_bypasses_llm(client, fixtures_dir):
     body = resp.json()
     assert "TRAP" not in body["reply"]
     assert body["reply"] == reagent_answer("ra1")
+
+
+@pytest.mark.parametrize(
+    "text,expected_name",
+    [
+        ("timer auf 5 minuten und nenne ihn chip washing", "chip washing"),
+        ("stell einen timer auf 5 minuten und benenn ihn chip washing", "chip washing"),
+        ("timer auf 5 minuten und bennen ihn chip washing", "chip washing"),  # user's typo
+        ("timer auf 10 minuten nenn ihn pause", "pause"),
+        ("timer auf 5 minuten", None),
+    ],
+)
+def test_parse_timer_name(client, text, expected_name):
+    from jarvis.remote_api import parse_timer_name
+
+    assert parse_timer_name(text) == expected_name
+
+
+def test_chat_timer_with_name_includes_it_in_reply_and_response(client):
+    from jarvis.llm import FakeLlm
+
+    client.app.state.llm = FakeLlm(["TRAP: should never be used"])
+    resp = client.post(
+        "/chat",
+        json={"message": "timer auf 5 minuten und nenne ihn chip washing"},
+        headers={"X-API-Key": "test-secret"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "TRAP" not in body["reply"]
+    assert body["timer_seconds"] == 300
+    assert body["timer_name"] == "chip washing"
+    assert "chip washing" in body["reply"].lower()
+
+
+def test_voice_timer_with_name_includes_it_in_response(client, fixtures_dir):
+    from jarvis.llm import FakeLlm
+    from jarvis.stt import FakeStt
+
+    client.app.state.stt = FakeStt(text="timer auf 2 minuten und nenne ihn pause")
+    client.app.state.llm = FakeLlm(["TRAP: should never be used"])
+    wav_bytes = (fixtures_dir / "sine_440.wav").read_bytes()
+    resp = client.post(
+        "/voice",
+        files={"audio": ("rec.wav", wav_bytes, "audio/wav")},
+        headers={"X-API-Key": "test-secret"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["timer_seconds"] == 120
+    assert body["timer_name"] == "pause"

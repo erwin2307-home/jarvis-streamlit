@@ -110,15 +110,24 @@ VOICE_WIDGET_HTML = r"""
     }
     .timer-chip {
       border: 3px solid #2b8cff; border-radius: 12px; padding: 4px 14px;
-      color: #ff3b3b; font-weight: 700; font-family: "Courier New", monospace;
-      font-size: 15px; background: rgba(43,140,255,0.08);
+      background: rgba(43,140,255,0.08); text-align: center;
       box-shadow: 0 0 10px #2b8cff55; transition: all 0.3s ease;
       opacity: 0.7; transform: scale(0.85);
     }
     .timer-chip.timer-foreground {
-      font-size: 26px; opacity: 1; transform: scale(1.15);
+      opacity: 1; transform: scale(1.15);
       box-shadow: 0 0 22px #2b8cffcc; z-index: 5;
     }
+    .timer-name {
+      color: #9fe8c0; font-size: 11px; font-weight: 600;
+      letter-spacing: 0.03em; text-transform: uppercase;
+      margin-bottom: 2px;
+    }
+    .timer-time {
+      color: #ff3b3b; font-weight: 700; font-family: "Courier New", monospace;
+      font-size: 15px;
+    }
+    .timer-chip.timer-foreground .timer-time { font-size: 26px; }
     #play-fallback {
       border: 1px solid #2b8cff; border-radius: 999px; padding: 6px 18px;
       font-size: 12px; color: #9fe8c0; background: transparent; cursor: pointer;
@@ -175,7 +184,7 @@ VOICE_WIDGET_HTML = r"""
       }
     }
 
-    let timers = []; // {id, remaining}
+    let timers = []; // {id, remaining, name}
     let timerIdSeq = 0;
 
     function formatMMSS(s) {
@@ -190,13 +199,22 @@ VOICE_WIDGET_HTML = r"""
       timers.forEach((t, idx) => {
         const chip = document.createElement("div");
         chip.className = "timer-chip" + (idx === 0 ? " timer-foreground" : "");
-        chip.textContent = formatMMSS(t.remaining);
+        if (t.name) {
+          const nameEl = document.createElement("div");
+          nameEl.className = "timer-name";
+          nameEl.textContent = t.name; // textContent, not innerHTML — name is user/STT-sourced text
+          chip.appendChild(nameEl);
+        }
+        const timeEl = document.createElement("div");
+        timeEl.className = "timer-time";
+        timeEl.textContent = formatMMSS(t.remaining);
+        chip.appendChild(timeEl);
         timersEl.appendChild(chip);
       });
     }
 
-    function addTimer(totalSeconds) {
-      timers.push({ id: ++timerIdSeq, remaining: totalSeconds });
+    function addTimer(totalSeconds, name) {
+      timers.push({ id: ++timerIdSeq, remaining: totalSeconds, name: name || null });
       renderTimers();
     }
 
@@ -342,7 +360,7 @@ VOICE_WIDGET_HTML = r"""
           const body = await resp.json();
           addLine("you", body.transcript);
           addLine("jarvis", body.reply);
-          if (body.timer_seconds) addTimer(body.timer_seconds);
+          if (body.timer_seconds) addTimer(body.timer_seconds, body.timer_name);
           setState("speaking");
 
           if (body.audio_base64) {

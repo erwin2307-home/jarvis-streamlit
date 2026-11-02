@@ -229,7 +229,27 @@ def parse_timer_seconds(text: str) -> int | None:
     return total if found else None
 
 
-def timer_reply(seconds: int | None) -> str:
+# "nenn ihn X" / "benenn ihn X" / "bennen ihn X" (common typo/mishearing
+# of "benennen") — whatever follows the naming verb (and an optional
+# "ihn"/"ihr"/"es"/"den timer") becomes the timer's label. Only this
+# explicit-naming-verb order is supported; a name given before the verb
+# ("timer chip washing auf 5 minuten") has no reliable boundary to parse.
+_TIMER_NAME_RE = re.compile(
+    r"\b(?:benenn\w*|bennen\w*|nenn\w*)\b\s*"
+    r"(?:ihn|ihr|es|den\s+timer|diesen\s+timer)?\s*(.+)$",
+    re.IGNORECASE,
+)
+
+
+def parse_timer_name(text: str) -> str | None:
+    m = _TIMER_NAME_RE.search(text)
+    if not m:
+        return None
+    name = m.group(1).strip().strip(".!?,;:")
+    return name or None
+
+
+def timer_reply(seconds: int | None, name: str | None = None) -> str:
     if seconds is None:
         return "Wie lange soll der Timer laufen?"
     minutes, secs = divmod(seconds, 60)
@@ -241,7 +261,8 @@ def timer_reply(seconds: int | None) -> str:
         parts.append(f"{minutes} Minute{'n' if minutes != 1 else ''}")
     if secs:
         parts.append(f"{secs} Sekunde{'n' if secs != 1 else ''}")
-    return f"Timer auf {' '.join(parts)} gestellt."
+    label = f" '{name}'" if name else ""
+    return f"Timer{label} auf {' '.join(parts)} gestellt."
 
 
 class ChatRequest(BaseModel):
@@ -252,6 +273,7 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     reply: str
     timer_seconds: int | None = None
+    timer_name: str | None = None
 
 
 def _check_key(x_api_key: str | None) -> None:
@@ -284,7 +306,8 @@ async def chat(
 
     if is_timer_query(req.message):
         secs = parse_timer_seconds(req.message)
-        return ChatResponse(reply=timer_reply(secs), timer_seconds=secs)
+        name = parse_timer_name(req.message)
+        return ChatResponse(reply=timer_reply(secs, name), timer_seconds=secs, timer_name=name)
 
     beadchip_answer = beadchip_fastpath_answer(req.message)
     if beadchip_answer is not None:
@@ -316,6 +339,7 @@ class VoiceResponse(BaseModel):
     audio_base64: str
     sample_rate: int
     timer_seconds: int | None = None
+    timer_name: str | None = None
 
 
 @app.post("/voice", response_model=VoiceResponse)
@@ -337,12 +361,14 @@ async def voice(
         raise HTTPException(status_code=400, detail="no speech recognized")
 
     timer_seconds: int | None = None
+    timer_name: str | None = None
     beadchip_answer = beadchip_fastpath_answer(transcript)
     if is_time_query(transcript):
         full = time_answer()
     elif is_timer_query(transcript):
         timer_seconds = parse_timer_seconds(transcript)
-        full = timer_reply(timer_seconds)
+        timer_name = parse_timer_name(transcript)
+        full = timer_reply(timer_seconds, timer_name)
     elif beadchip_answer is not None:
         full = beadchip_answer
     else:
@@ -376,4 +402,5 @@ async def voice(
         audio_base64=base64.b64encode(wav_bytes).decode("ascii"),
         sample_rate=settings.tts_sample_rate,
         timer_seconds=timer_seconds,
+        timer_name=timer_name,
     )
