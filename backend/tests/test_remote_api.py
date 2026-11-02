@@ -1,6 +1,7 @@
 """Remote chat/voice API tests. Uses Fake* backends injected onto
 app.state — never hits real Ollama/cloud/Whisper/TTS."""
 import base64
+import re
 
 import pytest
 
@@ -111,3 +112,61 @@ def test_voice_rejects_empty_transcript(client, fixtures_dir):
         headers={"X-API-Key": "test-secret"},
     )
     assert resp.status_code == 400
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["wie spät ist es", "Wie spät ist es?", "wieviel uhr ist es", "what time is it"],
+)
+def test_is_time_query_matches_time_questions(client, text):
+    from jarvis.remote_api import is_time_query
+
+    assert is_time_query(text) is True
+
+
+@pytest.mark.parametrize("text", ["wie geht es dir", "baue einen taschenrechner", "hallo"])
+def test_is_time_query_does_not_match_other_questions(client, text):
+    from jarvis.remote_api import is_time_query
+
+    assert is_time_query(text) is False
+
+
+_TIME_PATTERN = re.compile(r"\d{2}:\d{2} Uhr")
+
+
+def test_chat_answers_time_query_deterministically_without_llm(client):
+    # A tiny local model can hallucinate on "wie spät ist es" (observed live:
+    # answered with London weather instead of the time). Time queries must
+    # bypass the LLM entirely rather than rely on it reading the injected
+    # time context correctly.
+    from jarvis.llm import FakeLlm
+
+    class TrapLlm(FakeLlm):
+        pass
+
+    client.app.state.llm = TrapLlm(["TRAP: should never be used"])
+    resp = client.post(
+        "/chat", json={"message": "wie spät ist es"}, headers={"X-API-Key": "test-secret"}
+    )
+    assert resp.status_code == 200
+    reply = resp.json()["reply"]
+    assert "TRAP" not in reply
+    assert _TIME_PATTERN.search(reply)
+
+
+def test_voice_answers_time_query_deterministically_without_llm(client, fixtures_dir):
+    from jarvis.llm import FakeLlm
+    from jarvis.stt import FakeStt
+
+    client.app.state.stt = FakeStt(text="wie spät ist es")
+    client.app.state.llm = FakeLlm(["TRAP: should never be used"])
+    wav_bytes = (fixtures_dir / "sine_440.wav").read_bytes()
+    resp = client.post(
+        "/voice",
+        files={"audio": ("rec.wav", wav_bytes, "audio/wav")},
+        headers={"X-API-Key": "test-secret"},
+    )
+    assert resp.status_code == 200
+    reply = resp.json()["reply"]
+    assert "TRAP" not in reply
+    assert _TIME_PATTERN.search(reply)

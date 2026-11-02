@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import base64
 import io
+import re
+from datetime import datetime
 from fractions import Fraction
 
 import numpy as np
@@ -155,6 +157,29 @@ async def _synthesize_wav(tts: Tts, text: str) -> bytes:
     return buf.getvalue()
 
 
+_DE_WEEKDAY = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
+
+# A tiny local model (llama3.2:1b) can hallucinate on simple factual asks
+# despite the injected time context (observed live: asked "wie spät ist
+# es", got told the weather in London). Time questions are cheap to answer
+# deterministically, so they bypass the LLM entirely instead of trusting
+# it to read the system message correctly.
+_TIME_QUERY_RE = re.compile(
+    r"\b(wie spät|wieviel uhr|wie viel uhr|uhrzeit|what time|time is it)\b",
+    re.IGNORECASE,
+)
+
+
+def is_time_query(text: str) -> bool:
+    return bool(_TIME_QUERY_RE.search(text.strip()))
+
+
+def time_answer(now: datetime | None = None) -> str:
+    n = now or datetime.now().astimezone()
+    weekday = _DE_WEEKDAY[n.weekday()]
+    return f"Es ist {n.strftime('%H:%M')} Uhr ({weekday}, {n.day}.{n.month}.{n.year})."
+
+
 class ChatRequest(BaseModel):
     message: str
     history: list[dict[str, str]] = []  # [{"role": "user"|"assistant", "content": "..."}]
@@ -181,6 +206,9 @@ async def chat(
     _check_key(x_api_key)
     if not req.message.strip():
         raise HTTPException(status_code=400, detail="message must not be empty")
+
+    if is_time_query(req.message):
+        return ChatResponse(reply=time_answer())
 
     messages = [*req.history, {"role": "user", "content": req.message}]
     llm: Llm = app.state.llm
@@ -224,17 +252,20 @@ async def voice(
     if not transcript:
         raise HTTPException(status_code=400, detail="no speech recognized")
 
-    llm: Llm = app.state.llm
-    full = ""
-    try:
-        async for ev in llm.chat([{"role": "user", "content": transcript}]):
-            if ev.kind == "chunk":
-                full += ev.text
-            elif ev.kind == "done":
-                full = ev.text or full
-    except Exception as exc:
-        logger.error(f"remote_api: chat failed: {exc!r}")
-        raise HTTPException(status_code=502, detail="LLM backend failed") from exc
+    if is_time_query(transcript):
+        full = time_answer()
+    else:
+        llm: Llm = app.state.llm
+        full = ""
+        try:
+            async for ev in llm.chat([{"role": "user", "content": transcript}]):
+                if ev.kind == "chunk":
+                    full += ev.text
+                elif ev.kind == "done":
+                    full = ev.text or full
+        except Exception as exc:
+            logger.error(f"remote_api: chat failed: {exc!r}")
+            raise HTTPException(status_code=502, detail="LLM backend failed") from exc
 
     tts: Tts = app.state.tts
     try:
