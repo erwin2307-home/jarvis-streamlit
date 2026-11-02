@@ -36,6 +36,7 @@ Thumbs.db
 # Secrets
 Deepseek_api_key.txt
 Groq_api_key.txt
+remote_api_key.txt
 *.key
 .env
 .streamlit/secrets.toml
