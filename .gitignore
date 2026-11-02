@@ -1,0 +1,41 @@
+# Models (heavy, downloaded separately)
+models/
+
+# Brainstorm sessions
+.superpowers/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node / Tauri
+node_modules/
+dist/
+build/
+frontend/src-tauri/target/
+frontend/src-tauri/gen/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local settings
+.claude/
+
+# Secrets
+Deepseek_api_key.txt
+Groq_api_key.txt
+*.key
+.env
+.streamlit/secrets.toml
