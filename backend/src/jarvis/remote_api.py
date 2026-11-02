@@ -180,6 +180,66 @@ def time_answer(now: datetime | None = None) -> str:
     return f"Es ist {n.strftime('%H:%M')} Uhr ({weekday}, {n.day}.{n.month}.{n.year})."
 
 
+# Voice-set timers. Actually running the countdown + playing the alarm
+# happens client-side in the Streamlit widget (this API has no persistent
+# per-user state and the browser tab is what's actually open) — this just
+# detects the request and parses the duration deterministically, for the
+# same hallucination-avoidance reason as time_answer() above.
+_TIMER_TRIGGER_RE = re.compile(r"\btimer\b", re.IGNORECASE)
+
+_DE_NUMBER_WORDS = {
+    "ein": 1, "eine": 1, "eins": 1, "zwei": 2, "drei": 3, "vier": 4, "fünf": 5,
+    "sechs": 6, "sieben": 7, "acht": 8, "neun": 9, "zehn": 10, "elf": 11,
+    "zwölf": 12, "fünfzehn": 15, "zwanzig": 20, "dreißig": 30, "vierzig": 40,
+    "fünfundvierzig": 45, "fünfzig": 50, "sechzig": 60, "neunzig": 90,
+}
+
+_TIMER_DURATION_RE = re.compile(
+    r"(\d+|" + "|".join(_DE_NUMBER_WORDS) + r")\s*"
+    r"(stunden?|std\.?|minuten?|min\.?|sekunden?|sek\.?)",
+    re.IGNORECASE,
+)
+
+def _unit_to_seconds(unit: str) -> int:
+    u = unit.lower()
+    if u.startswith("std") or u.startswith("stunde"):
+        return 3600
+    if u.startswith("min"):
+        return 60
+    return 1  # sek/sekunde(n)
+
+
+def is_timer_query(text: str) -> bool:
+    return bool(_TIMER_TRIGGER_RE.search(text.strip()))
+
+
+def parse_timer_seconds(text: str) -> int | None:
+    """Sum every "<number> <unit>" match found (e.g. "1 Stunde 30 Minuten"
+    -> 5400). Returns None if no duration could be found at all."""
+    total = 0
+    found = False
+    for amount_str, unit in _TIMER_DURATION_RE.findall(text):
+        amount = _DE_NUMBER_WORDS.get(amount_str.lower()) or int(amount_str)
+        total += amount * _unit_to_seconds(unit)
+        found = True
+    return total if found else None
+
+
+def timer_reply(seconds: int | None) -> str:
+    if seconds is None:
+        return "Wie lange soll der Timer laufen?"
+    minutes, secs = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    parts = []
+    if hours:
+        parts.append(f"{hours} Stunde{'n' if hours != 1 else ''}")
+    if minutes:
+        parts.append(f"{minutes} Minute{'n' if minutes != 1 else ''}")
+    if secs:
+        parts.append(f"{secs} Sekunde{'n' if secs != 1 else ''}")
+    return f"Timer auf {' '.join(parts)} gestellt."
+
+
 class ChatRequest(BaseModel):
     message: str
     history: list[dict[str, str]] = []  # [{"role": "user"|"assistant", "content": "..."}]
@@ -187,6 +247,7 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     reply: str
+    timer_seconds: int | None = None
 
 
 def _check_key(x_api_key: str | None) -> None:
@@ -210,6 +271,10 @@ async def chat(
     if is_time_query(req.message):
         return ChatResponse(reply=time_answer())
 
+    if is_timer_query(req.message):
+        secs = parse_timer_seconds(req.message)
+        return ChatResponse(reply=timer_reply(secs), timer_seconds=secs)
+
     messages = [*req.history, {"role": "user", "content": req.message}]
     llm: Llm = app.state.llm
 
@@ -232,6 +297,7 @@ class VoiceResponse(BaseModel):
     reply: str
     audio_base64: str
     sample_rate: int
+    timer_seconds: int | None = None
 
 
 @app.post("/voice", response_model=VoiceResponse)
@@ -252,8 +318,12 @@ async def voice(
     if not transcript:
         raise HTTPException(status_code=400, detail="no speech recognized")
 
+    timer_seconds: int | None = None
     if is_time_query(transcript):
         full = time_answer()
+    elif is_timer_query(transcript):
+        timer_seconds = parse_timer_seconds(transcript)
+        full = timer_reply(timer_seconds)
     else:
         llm: Llm = app.state.llm
         full = ""
@@ -279,4 +349,5 @@ async def voice(
         reply=full,
         audio_base64=base64.b64encode(wav_bytes).decode("ascii"),
         sample_rate=settings.tts_sample_rate,
+        timer_seconds=timer_seconds,
     )

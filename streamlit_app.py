@@ -104,6 +104,21 @@ VOICE_WIDGET_HTML = r"""
       box-shadow: 0 0 28px #5fd4ffcc, 0 1px 0 #1a4d8c inset;
       transform: translateY(1px);
     }
+    #timers {
+      display: flex; gap: 10px; flex-wrap: wrap; justify-content: center;
+      min-height: 0; padding: 0 8px;
+    }
+    .timer-chip {
+      border: 3px solid #2b8cff; border-radius: 12px; padding: 4px 14px;
+      color: #ff3b3b; font-weight: 700; font-family: "Courier New", monospace;
+      font-size: 15px; background: rgba(43,140,255,0.08);
+      box-shadow: 0 0 10px #2b8cff55; transition: all 0.3s ease;
+      opacity: 0.7; transform: scale(0.85);
+    }
+    .timer-chip.timer-foreground {
+      font-size: 26px; opacity: 1; transform: scale(1.15);
+      box-shadow: 0 0 22px #2b8cffcc; z-index: 5;
+    }
     #play-fallback {
       border: 1px solid #2b8cff; border-radius: 999px; padding: 6px 18px;
       font-size: 12px; color: #9fe8c0; background: transparent; cursor: pointer;
@@ -114,6 +129,7 @@ VOICE_WIDGET_HTML = r"""
     <div id="ring-core"></div>
   </div>
   <button id="talk-btn" type="button">🎤 Gedrückt halten zum Sprechen</button>
+  <div id="timers"></div>
   <div id="status-line">Button oder Leertaste (Ring anklicken) halten zum Sprechen</div>
   <div id="hint-line"></div>
   <button id="play-fallback" type="button" style="display:none;">▶️ Antwort abspielen</button>
@@ -128,6 +144,58 @@ VOICE_WIDGET_HTML = r"""
     const transcriptEl = document.getElementById("transcript");
     const talkBtn = document.getElementById("talk-btn");
     const playFallback = document.getElementById("play-fallback");
+    const timersEl = document.getElementById("timers");
+
+    const ANIMAL_SOUNDS = [
+      "https://upload.wikimedia.org/wikipedia/commons/c/c5/Rooster_crowing.ogg",
+      "https://upload.wikimedia.org/wikipedia/commons/5/58/Barking_of_a_dog_2.ogg",
+      "https://upload.wikimedia.org/wikipedia/commons/0/0c/Meow_domestic_cat.ogg",
+      "https://upload.wikimedia.org/wikipedia/commons/4/48/Mudchute_cow_1.ogg",
+    ];
+
+    let timers = []; // {id, remaining}
+    let timerIdSeq = 0;
+
+    function formatMMSS(s) {
+      const m = Math.floor(s / 60);
+      const sec = s % 60;
+      return String(m).padStart(2, "0") + ":" + String(sec).padStart(2, "0");
+    }
+
+    function renderTimers() {
+      timers.sort((a, b) => a.remaining - b.remaining);
+      timersEl.innerHTML = "";
+      timers.forEach((t, idx) => {
+        const chip = document.createElement("div");
+        chip.className = "timer-chip" + (idx === 0 ? " timer-foreground" : "");
+        chip.textContent = formatMMSS(t.remaining);
+        timersEl.appendChild(chip);
+      });
+    }
+
+    function addTimer(totalSeconds) {
+      timers.push({ id: ++timerIdSeq, remaining: totalSeconds });
+      renderTimers();
+    }
+
+    function playRandomAnimal() {
+      const url = ANIMAL_SOUNDS[Math.floor(Math.random() * ANIMAL_SOUNDS.length)];
+      new Audio(url).play().catch(() => {});
+    }
+
+    setInterval(() => {
+      if (timers.length === 0) return;
+      const fired = [];
+      timers.forEach((t) => {
+        t.remaining -= 1;
+        if (t.remaining <= 0) fired.push(t.id);
+      });
+      if (fired.length > 0) {
+        fired.forEach(() => playRandomAnimal());
+        timers = timers.filter((t) => !fired.includes(t.id));
+      }
+      renderTimers();
+    }, 1000);
 
     let mediaStream = null;
     let recorder = null;
@@ -257,6 +325,7 @@ VOICE_WIDGET_HTML = r"""
           const body = await resp.json();
           addLine("you", body.transcript);
           addLine("jarvis", body.reply);
+          if (body.timer_seconds) addTimer(body.timer_seconds);
           setState("speaking");
 
           if (body.audio_base64) {

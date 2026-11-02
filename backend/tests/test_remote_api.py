@@ -170,3 +170,85 @@ def test_voice_answers_time_query_deterministically_without_llm(client, fixtures
     reply = resp.json()["reply"]
     assert "TRAP" not in reply
     assert _TIME_PATTERN.search(reply)
+
+
+@pytest.mark.parametrize(
+    "text,expected_seconds",
+    [
+        ("timer auf 5 minuten", 300),
+        ("stell einen timer auf 90 sekunden", 90),
+        ("timer auf 1 stunde 30 minuten", 5400),
+        ("timer auf zehn minuten", 600),
+        ("timer auf fünf minuten", 300),
+    ],
+)
+def test_parse_timer_seconds_parses_durations(client, text, expected_seconds):
+    from jarvis.remote_api import parse_timer_seconds
+
+    assert parse_timer_seconds(text) == expected_seconds
+
+
+def test_parse_timer_seconds_returns_none_without_a_duration(client):
+    from jarvis.remote_api import parse_timer_seconds
+
+    assert parse_timer_seconds("timer") is None
+
+
+@pytest.mark.parametrize("text", ["timer", "stell einen timer", "Timer auf 5 Minuten"])
+def test_is_timer_query_matches_timer_mentions(client, text):
+    from jarvis.remote_api import is_timer_query
+
+    assert is_timer_query(text) is True
+
+
+@pytest.mark.parametrize("text", ["wie spät ist es", "baue einen taschenrechner", "hallo"])
+def test_is_timer_query_does_not_match_other_questions(client, text):
+    from jarvis.remote_api import is_timer_query
+
+    assert is_timer_query(text) is False
+
+
+def test_chat_timer_with_duration_sets_timer_seconds_without_llm(client):
+    from jarvis.llm import FakeLlm
+
+    client.app.state.llm = FakeLlm(["TRAP: should never be used"])
+    resp = client.post(
+        "/chat",
+        json={"message": "timer auf 5 minuten"},
+        headers={"X-API-Key": "test-secret"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "TRAP" not in body["reply"]
+    assert body["timer_seconds"] == 300
+
+
+def test_chat_timer_without_duration_asks_for_one(client):
+    from jarvis.llm import FakeLlm
+
+    client.app.state.llm = FakeLlm(["TRAP: should never be used"])
+    resp = client.post(
+        "/chat", json={"message": "timer"}, headers={"X-API-Key": "test-secret"}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "TRAP" not in body["reply"]
+    assert body["timer_seconds"] is None
+
+
+def test_voice_timer_with_duration_sets_timer_seconds_without_llm(client, fixtures_dir):
+    from jarvis.llm import FakeLlm
+    from jarvis.stt import FakeStt
+
+    client.app.state.stt = FakeStt(text="timer auf 2 minuten")
+    client.app.state.llm = FakeLlm(["TRAP: should never be used"])
+    wav_bytes = (fixtures_dir / "sine_440.wav").read_bytes()
+    resp = client.post(
+        "/voice",
+        files={"audio": ("rec.wav", wav_bytes, "audio/wav")},
+        headers={"X-API-Key": "test-secret"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "TRAP" not in body["reply"]
+    assert body["timer_seconds"] == 120
