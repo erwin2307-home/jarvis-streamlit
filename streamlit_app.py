@@ -2,7 +2,7 @@
 
 Deployed to Streamlit Community Cloud. Talks to the real LLM (and STT/TTS)
 running on your own machine (jarvis/backend/src/jarvis/remote_api.py) over
-a public tunnel URL (ngrok/cloudflared) you paste into the sidebar — this
+a public tunnel URL (ngrok/cloudflared) configured in st.secrets — this
 app itself never runs any model.
 
 Voice turns (recording -> /voice -> transcript+reply+TTS audio) run
@@ -26,55 +26,41 @@ stability is what keeps the iframe (and its live countdown timers) from
 being torn down and recreated every time something elsewhere on the page
 triggers a rerun.
 
-API_KEY itself is read ONLY from st.secrets (_default("API_KEY")) — there
-is deliberately no sidebar widget for it, editable or otherwise. A
-text_input prefilled with a secret still ships that value to the browser
-to render the widget (Streamlit has to, to display it), inspectable via
-devtools regardless of type="password" masking it visually; the only
-way to not leak it is to never put it in a widget at all. API_URL isn't
-secret the same way (it's already visible in every /voice network call
-the browser makes anyway) and stays an editable sidebar field, since the
-tunnel URL changes on every restart.
+API_KEY and API_URL are BOTH read ONLY from st.secrets — there is
+deliberately no sidebar widget for either, editable or otherwise.
+
+For API_KEY: a text_input prefilled with a secret still ships that value
+to the browser to render the widget (Streamlit has to, to display it),
+inspectable via devtools regardless of type="password" masking it
+visually; the only way to not leak it is to never put it in a widget.
+
+For API_URL: this page is public, so an editable sidebar field for it is
+editable by ANY visitor, not just the owner. An earlier version allowed
+it but checked the hostname against known tunnel-provider domain suffixes
+(*.trycloudflare.com etc.) — that is NOT a security boundary, since those
+are shared public domains anyone can get their own free subdomain under
+in seconds (`cloudflared tunnel --url ...` against their own server).
+A visitor could still point it at their own tunnel and the credentialed
+server-side requests below (session-token mint, typed-chat /chat call)
+would hand them the real API_KEY. Pinning it to st.secrets closes that:
+whoever can edit this app's secrets is the only one who decides where
+the key is sent, same trust level as the key itself.
+
+The cost: since quick tunnels (cloudflared/ngrok without an account) get
+a new random hostname every restart, API_URL in secrets needs updating
+on Streamlit Cloud after every tunnel restart — there's no way to keep
+both that convenience and this security property with a shared-domain
+quick tunnel. A named Cloudflare Tunnel on a domain you own would give a
+fixed hostname and remove this friction, but that's a bigger one-time
+setup, not done here.
 """
 from __future__ import annotations
-
-import ipaddress
-from urllib.parse import urlparse
 
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
 
 st.set_page_config(page_title="Jeanny", page_icon="🤖")
-
-# api_url is editable by ANY visitor of this public page, not just you —
-# it's a plain sidebar text_input. Without a check here, a visitor could
-# point it at their own server and the credentialed server-side requests
-# below (minting a session token, or the typed-chat /chat call) would
-# hand them the real API_KEY. Only these tunnel providers' hostnames are
-# trusted to receive it; a cloudflared/ngrok quick tunnel always looks
-# like this, so legitimate use is unaffected.
-_ALLOWED_TUNNEL_SUFFIXES = (".trycloudflare.com", ".ngrok-free.app", ".ngrok.app", ".ngrok.io")
-
-
-def _is_allowed_tunnel_url(url: str) -> bool:
-    try:
-        parsed = urlparse(url)
-    except ValueError:
-        return False
-    if parsed.scheme != "https":
-        return False
-    if parsed.username or parsed.password:
-        return False
-    if parsed.port is not None and parsed.port != 443:
-        return False
-    hostname = parsed.hostname or ""
-    try:
-        ipaddress.ip_address(hostname)
-        return False  # a literal IP is never a legitimate tunnel hostname
-    except ValueError:
-        pass
-    return any(hostname.endswith(suffix) for suffix in _ALLOWED_TUNNEL_SUFFIXES)
 
 
 def _default(key: str, fallback: str = "") -> str:
@@ -89,7 +75,7 @@ def get_voice_session_token(api_url: str, api_key: str) -> str | None:
     widget, re-minting only when api_url/api_key actually change — minting
     on every rerun would still be safe but would waste a round trip on
     every typed chat message too."""
-    if not _is_allowed_tunnel_url(api_url):
+    if not api_url.startswith("https://"):
         return None
     cache_key = (api_url, api_key)
     cached = st.session_state.get("_voice_token_cache")
@@ -637,28 +623,29 @@ def render_voice_widget(api_url: str, voice_token: str) -> None:
     components.html(html, height=380)
 
 
+# API_KEY and API_URL come ONLY from st.secrets — never from a widget.
+# See the module docstring for why API_URL is pinned here too, not just
+# the key: an editable sidebar field for it would let any visitor of this
+# public page redirect where the real key gets sent.
+api_key = _default("API_KEY")
+api_url = _default("API_URL")
+
 with st.sidebar:
     st.header("Verbindung")
-    api_url = st.text_input(
-        "API-URL (Tunnel)",
-        value=st.session_state.get("api_url", _default("API_URL")),
-        placeholder="https://xxxx.trycloudflare.com",
-        help="Die öffentliche Tunnel-URL deines lokalen Rechners "
-        "(cloudflared/ngrok). Ändert sich bei jedem Neustart des Tunnels.",
+    if api_url:
+        st.caption(f"Tunnel: `{api_url}`")
+    else:
+        st.caption("Tunnel: nicht konfiguriert (API_URL fehlt in den Secrets)")
+    st.caption(
+        "API-URL und API-Key werden nur über die Streamlit-Secrets "
+        "konfiguriert (Settings -> Secrets), nicht hier auf der Seite — "
+        "sonst könnte jeder Besucher den echten Key auf einen eigenen "
+        "Server umleiten."
     )
-    st.session_state["api_url"] = api_url
 
     if st.button("Text-Verlauf löschen"):
         st.session_state["messages"] = []
         st.rerun()
-
-# API_KEY comes ONLY from st.secrets — never from a widget. A text_input
-# prefilled with a secret still ships that value to the browser to render
-# the widget (Streamlit has to, to display it), inspectable via devtools
-# regardless of type="password" masking it visually. There is no on-page
-# way to view or edit it; set it in the app's Secrets on Streamlit Cloud
-# (or .streamlit/secrets.toml locally) and nowhere else.
-api_key = _default("API_KEY")
 
 st.title("🤖 Jeanny")
 
@@ -672,7 +659,7 @@ if api_url and api_key:
             "Tunnel/API-Key prüfen. Getippter Chat unten geht trotzdem."
         )
 elif not api_url:
-    st.info("API-URL in der Sidebar eintragen, um das Sprach-Widget zu nutzen.")
+    st.info("API_URL fehlt in den Secrets (Settings -> Secrets auf Streamlit Cloud).")
 else:
     st.info("API_KEY fehlt in den Secrets (Settings -> Secrets auf Streamlit Cloud).")
 
@@ -692,10 +679,7 @@ prompt = st.chat_input("…oder Nachricht an Jeanny tippen")
 
 if prompt:
     if not api_url or not api_key:
-        st.error("API-URL (Sidebar) und API_KEY (Secrets) müssen gesetzt sein.")
-        st.stop()
-    if not _is_allowed_tunnel_url(api_url):
-        st.error("API-URL sieht nicht wie ein cloudflared/ngrok-Tunnel aus — abgelehnt.")
+        st.error("API_URL und API_KEY müssen in den Secrets gesetzt sein.")
         st.stop()
 
     st.session_state["messages"].append({"role": "user", "content": prompt})
