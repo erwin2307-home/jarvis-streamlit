@@ -25,6 +25,16 @@ so the embedded HTML stays byte-identical across Streamlit reruns — that
 stability is what keeps the iframe (and its live countdown timers) from
 being torn down and recreated every time something elsewhere on the page
 triggers a rerun.
+
+API_KEY itself is read ONLY from st.secrets (_default("API_KEY")) — there
+is deliberately no sidebar widget for it, editable or otherwise. A
+text_input prefilled with a secret still ships that value to the browser
+to render the widget (Streamlit has to, to display it), inspectable via
+devtools regardless of type="password" masking it visually; the only
+way to not leak it is to never put it in a widget at all. API_URL isn't
+secret the same way (it's already visible in every /voice network call
+the browser makes anyway) and stays an editable sidebar field, since the
+tunnel URL changes on every restart.
 """
 from __future__ import annotations
 
@@ -456,7 +466,7 @@ VOICE_WIDGET_HTML = r"""
     async function startRecording() {
       if (isActive) return; // already recording (button+space overlap) — ignore
       if (!API_URL || !API_KEY) {
-        statusLine.textContent = "API-URL/API-Key fehlen (Sidebar ausfüllen)";
+        statusLine.textContent = "API-URL fehlt oder kein Sitzungs-Token (siehe Hinweis oben)";
         return;
       }
       try {
@@ -601,17 +611,19 @@ with st.sidebar:
         help="Die öffentliche Tunnel-URL deines lokalen Rechners "
         "(cloudflared/ngrok). Ändert sich bei jedem Neustart des Tunnels.",
     )
-    api_key = st.text_input(
-        "API-Key",
-        value=st.session_state.get("api_key", _default("API_KEY")),
-        type="password",
-    )
     st.session_state["api_url"] = api_url
-    st.session_state["api_key"] = api_key
 
     if st.button("Text-Verlauf löschen"):
         st.session_state["messages"] = []
         st.rerun()
+
+# API_KEY comes ONLY from st.secrets — never from a widget. A text_input
+# prefilled with a secret still ships that value to the browser to render
+# the widget (Streamlit has to, to display it), inspectable via devtools
+# regardless of type="password" masking it visually. There is no on-page
+# way to view or edit it; set it in the app's Secrets on Streamlit Cloud
+# (or .streamlit/secrets.toml locally) and nowhere else.
+api_key = _default("API_KEY")
 
 st.title("🤖 Jeanny")
 
@@ -624,8 +636,10 @@ if api_url and api_key:
             "Konnte kein Sitzungs-Token für das Sprach-Widget holen — "
             "Tunnel/API-Key prüfen. Getippter Chat unten geht trotzdem."
         )
+elif not api_url:
+    st.info("API-URL in der Sidebar eintragen, um das Sprach-Widget zu nutzen.")
 else:
-    st.info("API-URL und API-Key in der Sidebar eintragen, um das Sprach-Widget zu nutzen.")
+    st.info("API_KEY fehlt in den Secrets (Settings -> Secrets auf Streamlit Cloud).")
 
 st.caption(
     "Sprache läuft direkt im Widget oben (Leertaste halten). "
@@ -643,7 +657,7 @@ prompt = st.chat_input("…oder Nachricht an Jeanny tippen")
 
 if prompt:
     if not api_url or not api_key:
-        st.error("API-URL und API-Key in der Sidebar eintragen.")
+        st.error("API-URL (Sidebar) und API_KEY (Secrets) müssen gesetzt sein.")
         st.stop()
 
     st.session_state["messages"].append({"role": "user", "content": prompt})
