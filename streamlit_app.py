@@ -38,11 +38,43 @@ tunnel URL changes on every restart.
 """
 from __future__ import annotations
 
+import ipaddress
+from urllib.parse import urlparse
+
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
 
 st.set_page_config(page_title="Jeanny", page_icon="🤖")
+
+# api_url is editable by ANY visitor of this public page, not just you —
+# it's a plain sidebar text_input. Without a check here, a visitor could
+# point it at their own server and the credentialed server-side requests
+# below (minting a session token, or the typed-chat /chat call) would
+# hand them the real API_KEY. Only these tunnel providers' hostnames are
+# trusted to receive it; a cloudflared/ngrok quick tunnel always looks
+# like this, so legitimate use is unaffected.
+_ALLOWED_TUNNEL_SUFFIXES = (".trycloudflare.com", ".ngrok-free.app", ".ngrok.app", ".ngrok.io")
+
+
+def _is_allowed_tunnel_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    if parsed.scheme != "https":
+        return False
+    if parsed.username or parsed.password:
+        return False
+    if parsed.port is not None and parsed.port != 443:
+        return False
+    hostname = parsed.hostname or ""
+    try:
+        ipaddress.ip_address(hostname)
+        return False  # a literal IP is never a legitimate tunnel hostname
+    except ValueError:
+        pass
+    return any(hostname.endswith(suffix) for suffix in _ALLOWED_TUNNEL_SUFFIXES)
 
 
 def _default(key: str, fallback: str = "") -> str:
@@ -57,6 +89,8 @@ def get_voice_session_token(api_url: str, api_key: str) -> str | None:
     widget, re-minting only when api_url/api_key actually change — minting
     on every rerun would still be safe but would waste a round trip on
     every typed chat message too."""
+    if not _is_allowed_tunnel_url(api_url):
+        return None
     cache_key = (api_url, api_key)
     cached = st.session_state.get("_voice_token_cache")
     if cached and cached[0] == cache_key:
@@ -67,6 +101,7 @@ def get_voice_session_token(api_url: str, api_key: str) -> str | None:
             f"{api_url.rstrip('/')}/session-token",
             headers={"X-API-Key": api_key},
             timeout=10,
+            allow_redirects=False,  # never replay the header to a redirect target
         )
         resp.raise_for_status()
         token = resp.json()["token"]
@@ -659,6 +694,9 @@ if prompt:
     if not api_url or not api_key:
         st.error("API-URL (Sidebar) und API_KEY (Secrets) müssen gesetzt sein.")
         st.stop()
+    if not _is_allowed_tunnel_url(api_url):
+        st.error("API-URL sieht nicht wie ein cloudflared/ngrok-Tunnel aus — abgelehnt.")
+        st.stop()
 
     st.session_state["messages"].append({"role": "user", "content": prompt})
     with st.chat_message("user"):
@@ -675,6 +713,7 @@ if prompt:
                     },
                     headers={"X-API-Key": api_key},
                     timeout=120,
+                    allow_redirects=False,  # never replay the header to a redirect target
                 )
                 if resp.status_code == 401:
                     reply = "⚠️ API-Key falsch oder fehlt."
