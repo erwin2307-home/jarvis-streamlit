@@ -30,8 +30,9 @@ cloudflared tunnel --url http://localhost:8800
 ```
 
 It prints a `https://xxxx.trycloudflare.com` URL. This URL changes every
-time you restart the tunnel — that's why the Streamlit app takes it as a
-sidebar field, not a hardcoded constant.
+time you restart the tunnel, so you'll update it in Secrets (step 4)
+after every restart — see the Notes below for why it's not a sidebar
+field.
 
 (ngrok works the same way: `ngrok http 8800`.)
 
@@ -57,9 +58,8 @@ are gitignored — check `git status` before pushing if unsure.
    API_URL = "https://xxxx.trycloudflare.com"
    API_KEY = "the same secret you set as JARVIS_REMOTE_API_KEY"
    ```
-3. Deploy. The sidebar fields pre-fill from secrets but can be overridden
-   live (useful since the tunnel URL changes on every restart — update it
-   in the sidebar without redeploying).
+3. Deploy. No restart needed to pick up a Secrets change — Streamlit
+   Cloud re-runs the script with the new values automatically.
 
 ## Notes
 
@@ -69,3 +69,15 @@ are gitignored — check `git status` before pushing if unsure.
 - The API key is the only thing standing between the public tunnel URL
   and your local LLM — treat it like a password, rotate it if you
   suspect it leaked.
+- Both API_URL and API_KEY are Secrets-only, with no sidebar field for
+  either (an earlier version had a sidebar field for API_URL). A quick
+  tunnel's hostname is a random subdomain of a shared public domain
+  (`*.trycloudflare.com`) — anyone can get their own in seconds, so an
+  editable field for it would let any visitor of this public page
+  redirect the server-side credentialed requests (session-token mint,
+  typed chat) to their own server and steal API_KEY. Pinning both to
+  Secrets means only whoever can edit this app's Secrets decides where
+  the key is sent — the tradeoff is updating API_URL there after every
+  tunnel restart instead of pasting it into the page. A named Cloudflare
+  Tunnel on a domain you own gets a fixed hostname and removes that
+  friction, at the cost of a one-time Cloudflare account + domain setup.
