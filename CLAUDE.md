@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Jarvis: offline-first voice assistant. Wake-word → VAD → STT → LLM → TTS pipeline, driven by a Python/FastAPI backend and a Tauri (React + Three.js) desktop HUD frontend connected over a single WebSocket. Currently Phase 1 + 1.5 (core voice loop, barge-in, hotkey trigger). No tools/system-control, no vision, no conversation memory yet — those are later phases. "Offline-first" is now an overstatement for TTS specifically: the default voice backend (`edge-tts`) needs internet — see `settings.tts_backend`.
+Jarvis: offline-first voice assistant, persona-named "Jeanny" in its system prompt (`settings.llm_system_prompt`) — repo/code identifiers still say "jarvis" throughout, don't rename them to match. Wake-word → VAD → STT → LLM → TTS pipeline, driven by a Python/FastAPI backend and a Tauri (React + Three.js) desktop HUD frontend connected over a single WebSocket. Currently Phase 1 + 1.5 (core voice loop, barge-in, hotkey trigger). No tools/system-control, no vision, no conversation memory yet — those are later phases. "Offline-first" is now an overstatement for TTS specifically: the default voice backend (`edge-tts`) needs internet — see `settings.tts_backend`.
+
+There's a second, separate surface: `backend/src/jarvis/remote_api.py` + `streamlit_app.py` (repo root) — a text/voice chat API meant to be tunneled to the internet, with a thin Streamlit Cloud frontend. See "Remote API + Streamlit frontend" below before touching either file; it has different security constraints than the main app.
 
 ## Commands
 
@@ -37,6 +39,14 @@ Both dev launchers (`scripts/dev.sh` and `scripts/start-jarvis.ps1`) default `JA
 
 Backend alone, without loading heavy models (used by tests/imports): `JARVIS_START_ORCHESTRATOR` unset or `0`. Set to `1` to actually wire up mic/wake/VAD/STT/LLM/TTS on startup (`app.py`'s `_startup` hook).
 
+### Remote API + Streamlit frontend (one-click: `scripts/start-streamlit-remote.ps1`)
+```bash
+cd backend && JARVIS_REMOTE_API_KEY="pick-a-long-random-secret" uv run uvicorn jarvis.remote_api:app --host 0.0.0.0 --port 8800
+cloudflared tunnel --url http://localhost:8800     # or: ngrok http 8800
+streamlit run streamlit_app.py                     # local preview; prod deploy is Streamlit Community Cloud
+```
+`remote_api.py` refuses to start without `JARVIS_REMOTE_API_KEY` set — it's designed to sit behind a public tunnel, so "no key configured" fails closed rather than starting wide open. The one-click script sources this key from a gitignored `remote_api_key.txt` at repo root instead of an inline env var — generate that file first (see `STREAMLIT_SETUP.md` for the full tunnel/deploy walkthrough).
+
 ## Architecture
 
 ### Backend: state machine + orchestrator
@@ -59,6 +69,12 @@ All components the orchestrator depends on (mic, speaker, wake, VAD, STT, LLM, T
 
 **TTS backend (`tts.py`):** two implementations behind the same `Tts` protocol, picked by `settings.tts_backend` ("edge" default, "piper" fallback) in `app.py`. `EdgeTts` (Microsoft's free neural voices via the `edge-tts` package, no API key) buffers the full MP3 response before decoding — individual streamed MP3 chunks aren't independently decodable — then sub-chunks the decoded PCM for playback; needs internet, no local model file. `RealTts` is the original Piper path, fully offline but the only German female Piper voices (eva_k/kerstin/ramona) are low/x-low quality tier, which is why `edge-tts` is now the default. **`settings.tts_sample_rate` must match whichever backend is active** (`RealSpeaker` is constructed with it) — edge-tts/Katja outputs 24000 Hz, Piper outputs 22050 Hz; mismatch plays audio at the wrong pitch/speed.
 
+### Remote API (`remote_api.py`) + Streamlit frontend (`streamlit_app.py`)
+
+Deliberately separate FastAPI app from `app.py` — not a mode switch on the same server. Reuses `HybridLlm`/STT/TTS (same config, same routing) but drops everything that's unsafe or pointless to expose publicly: **no coding fast-path** (auto-running generated code on an internet-reachable endpoint would be remote code execution), **no WebSocket**, no mic/speaker/wake/VAD — just two HTTP routes, `/chat` (JSON text) and `/voice` (upload WAV, get back transcript + reply + base64 WAV), both gated by a static `X-API-Key` header checked against `settings.remote_api_key`. Time queries and timer requests (`is_time_query`/`is_timer_query`) are regex-detected and answered deterministically here, independent of anything in `qa_lookup.py` — small local models reliably hallucinate on these otherwise (e.g. `llama3.2:1b` asked "wie spät ist es" answered with London's weather despite the injected time context), so these bypass the LLM entirely rather than trusting it to read the system message. The BeadChip QA fast-path (`beadchip_fastpath_answer`) is *not* independent the same way: it calls the same `qa_lookup.best_match` keyword-overlap matcher against the same `qa_beadchip.BEADCHIP_QA` dataset that `app.py` wires into the main voice app's `qa_matcher`, only adding `reagent_answer()` (`qa_beadchip.py`) as an extra bypass for bare reagent abbreviations that `best_match` wouldn't catch.
+
+Voice-set timers: the countdown and alarm playback happen **client-side** in the Streamlit voice widget (plain JS inside a `components.html` iframe) — this API has no per-user session state and the browser tab is what's actually open, so the server's job is only to parse a duration out of speech deterministically (`parse_timer_seconds`, German number-words + units) and hand back `timer_seconds`/`timer_name` for the widget to run. `streamlit_app.py` itself never runs a model — it's a thin client that calls the tunneled `remote_api` URL (pasted into the sidebar, since the tunnel URL changes every restart) directly from the browser for voice, and through Streamlit's own server for typed chat (`st.chat_input` → `/chat`). These two paths keep separate transcripts: the iframe has no channel back into Streamlit's Python session state.
+
 ### LLM routing (`llm.py`)
 
 `HybridLlm` wraps a local Ollama backend and an optional cloud backend (`OpenAiCompatLlm` — generic OpenAI-compatible client, works for Groq or DeepSeek). The cloud backend is only constructed if a key is found: Groq preferred (`JARVIS_GROQ_API_KEY` or `Groq_api_key.txt`), else DeepSeek (`JARVIS_DEEPSEEK_API_KEY` or `Deepseek_api_key.txt`), both files gitignored, resolved in `app.py`'s startup hook. No cloud key at all → local-only (`llama3.2:1b`, chosen for CPU speed since it's mostly an emergency fallback). Two routing strategies, set via `JARVIS_ROUTE_STRATEGY`:
@@ -79,8 +95,13 @@ Outbound (backend → frontend) and inbound (frontend → backend) WebSocket mes
 
 All runtime settings are env-var driven (`JARVIS_*` prefix) with defaults, loaded once via `get_settings()` (lru_cache). No config files — check this module for the full list rather than grepping for magic strings elsewhere.
 
+### Plugin scaffold (`plugin/`)
+
+`Tool.register()` decorator + a global `Registry` for OpenAI-style function-calling tools (`helpers.py` is empty). Nothing calls into this yet — no tool is registered anywhere, `HybridLlm`/`RealLlm` don't pass tool schemas to the model. This is Phase 2 scaffolding only; don't assume registered tools exist or are wired into the orchestrator.
+
 ## Project docs
 
 - `docs/superpowers/specs/2026-05-14-jarvis-hud-design.md` — HUD design spec
 - `docs/superpowers/plans/2026-05-14-jarvis-phase1-core.md`, `.../2026-05-14-jarvis-phase1-5-finish.md` — phase plans (written by the `superpowers` skill set; `.original.md` siblings are pre-compression full-prose backups, not meant to be edited)
 - `README.md` — setup prerequisites and the Phase 1.5 manual smoke-test runbook
+- `STREAMLIT_SETUP.md` — tunnel + Streamlit Community Cloud deploy walkthrough for `remote_api.py`/`streamlit_app.py`

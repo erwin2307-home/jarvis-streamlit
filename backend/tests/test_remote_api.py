@@ -415,3 +415,93 @@ def test_voice_timer_with_name_includes_it_in_response(client, fixtures_dir):
     body = resp.json()
     assert body["timer_seconds"] == 120
     assert body["timer_name"] == "pause"
+
+
+def test_session_token_requires_real_master_key(client):
+    resp = client.post("/session-token", headers={"X-API-Key": "wrong"})
+    assert resp.status_code == 401
+
+
+def test_session_token_mint_returns_usable_token(client):
+    resp = client.post("/session-token", headers={"X-API-Key": "test-secret"})
+    assert resp.status_code == 200
+    token = resp.json()["token"]
+    assert token
+
+    chat_resp = client.post(
+        "/chat", json={"message": "hi"}, headers={"X-API-Key": token}
+    )
+    assert chat_resp.status_code == 200
+
+
+def test_session_token_cannot_mint_another_token(client):
+    # A leaked session token must not be able to mint itself fresh ones
+    # forever — that would defeat the whole point of it expiring.
+    resp = client.post("/session-token", headers={"X-API-Key": "test-secret"})
+    token = resp.json()["token"]
+
+    resp2 = client.post("/session-token", headers={"X-API-Key": token})
+    assert resp2.status_code == 401
+
+
+def test_voice_works_with_session_token_instead_of_master_key(client, fixtures_dir):
+    token = client.post(
+        "/session-token", headers={"X-API-Key": "test-secret"}
+    ).json()["token"]
+    wav_bytes = (fixtures_dir / "sine_440.wav").read_bytes()
+    resp = client.post(
+        "/voice",
+        files={"audio": ("rec.wav", wav_bytes, "audio/wav")},
+        headers={"X-API-Key": token},
+    )
+    assert resp.status_code == 200
+
+
+@pytest.mark.parametrize("text", ["cool down", "starte cool down", "starte coool down"])
+def test_is_cooldown_trigger_matches(client, text):
+    from jarvis.remote_api import is_cooldown_trigger
+
+    assert is_cooldown_trigger(text) is True
+
+
+@pytest.mark.parametrize("text", ["wie spät ist es", "chip bath", "cooler"])
+def test_is_cooldown_trigger_does_not_match_other_text(client, text):
+    from jarvis.remote_api import is_cooldown_trigger
+
+    assert is_cooldown_trigger(text) is False
+
+
+@pytest.mark.parametrize("text", ["weiter", "Weiter.", "  weiter  "])
+def test_is_continue_query_matches(client, text):
+    from jarvis.remote_api import is_continue_query
+
+    assert is_continue_query(text) is True
+
+
+@pytest.mark.parametrize("text", ["weiter so gehts nicht", "immer weiter", "hallo"])
+def test_is_continue_query_does_not_match_other_text(client, text):
+    from jarvis.remote_api import is_continue_query
+
+    assert is_continue_query(text) is False
+
+
+def test_chat_cooldown_trigger_bypasses_llm(client):
+    from jarvis.llm import FakeLlm
+
+    client.app.state.llm = FakeLlm(["TRAP: should never be used"])
+    resp = client.post(
+        "/chat", json={"message": "starte cool down"}, headers={"X-API-Key": "test-secret"}
+    )
+    assert resp.status_code == 200
+    assert "TRAP" not in resp.json()["reply"]
+
+
+def test_chat_continue_query_bypasses_llm(client):
+    from jarvis.llm import FakeLlm
+
+    client.app.state.llm = FakeLlm(["TRAP: should never be used"])
+    resp = client.post(
+        "/chat", json={"message": "weiter"}, headers={"X-API-Key": "test-secret"}
+    )
+    assert resp.status_code == 200
+    assert "TRAP" not in resp.json()["reply"]

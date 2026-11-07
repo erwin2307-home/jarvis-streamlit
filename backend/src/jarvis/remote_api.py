@@ -17,7 +17,8 @@ from __future__ import annotations
 import base64
 import io
 import re
-from datetime import datetime
+import secrets
+from datetime import datetime, timedelta, timezone
 from fractions import Fraction
 
 import numpy as np
@@ -132,6 +133,21 @@ def _build_tts() -> Tts:
 app.state.llm = _build_llm()
 app.state.stt = _build_stt()
 app.state.tts = _build_tts()
+
+# Short-lived tokens so the browser never has to carry the real master
+# key. The Streamlit frontend's voice widget runs entirely client-side
+# (see streamlit_app.py — it has to, to keep its countdown timers alive
+# across Streamlit reruns) and talks to this API directly from the
+# browser, which means whatever credential it holds is visible to anyone
+# who opens page source on the public Streamlit app. Streamlit mints a
+# token here (server-side call, real key never leaves Streamlit's own
+# Python process) and embeds only the token in the page; a leaked token
+# is still usable, same as the leaked real key would be, but it expires
+# and can be revoked without rotating JARVIS_REMOTE_API_KEY everywhere
+# else. In-memory only — restarting this process invalidates all of them.
+SESSION_TOKEN_TTL = timedelta(hours=12)
+_session_tokens: dict[str, datetime] = {}
+app.state.session_tokens = _session_tokens
 
 
 def _decode_wav_to_pcm16(raw: bytes, target_sr: int) -> npt.NDArray[np.int16]:
@@ -277,8 +293,14 @@ class ChatResponse(BaseModel):
 
 
 def _check_key(x_api_key: str | None) -> None:
-    if x_api_key != settings.remote_api_key:
-        raise HTTPException(status_code=401, detail="invalid or missing X-API-Key")
+    """Accepts the real master key OR a currently-valid session token —
+    see the session_tokens comment above for why both exist."""
+    if x_api_key == settings.remote_api_key:
+        return
+    expiry = app.state.session_tokens.get(x_api_key or "")
+    if expiry is not None and expiry > datetime.now(timezone.utc):
+        return
+    raise HTTPException(status_code=401, detail="invalid or missing X-API-Key")
 
 
 def beadchip_fastpath_answer(text: str) -> str | None:
@@ -288,9 +310,48 @@ def beadchip_fastpath_answer(text: str) -> str | None:
     return best_match(text, BEADCHIP_QA) or reagent_answer(text)
 
 
+# "Cool down" lab-protocol macro (30 min cooldown -> named wash/bath timers
+# -> instrument choice, each step voice-gated on "weiter") lives entirely
+# client-side in the Streamlit voice widget's JS — it has to, since that's
+# the only thing that stays alive across the whole multi-step sequence
+# (see the session_tokens comment above). The server's only job for it is
+# to not waste an LLM call (and a spoken-aloud irrelevant answer) on these
+# two trigger phrases; the client independently re-checks the transcript
+# text for the same patterns to actually drive the workflow.
+_COOLDOWN_TRIGGER_RE = re.compile(r"\bco+l\s*down\b", re.IGNORECASE)
+_CONTINUE_RE = re.compile(r"^\s*weiter\.?\s*$", re.IGNORECASE)
+
+
+def is_cooldown_trigger(text: str) -> bool:
+    return bool(_COOLDOWN_TRIGGER_RE.search(text.strip()))
+
+
+def is_continue_query(text: str) -> bool:
+    return bool(_CONTINUE_RE.search(text.strip()))
+
+
 @app.get("/health")
 async def health() -> dict[str, object]:
     return {"ok": True, "version": __version__}
+
+
+class SessionTokenResponse(BaseModel):
+    token: str
+    expires_at: str
+
+
+@app.post("/session-token", response_model=SessionTokenResponse)
+async def session_token(x_api_key: str | None = Header(default=None)) -> SessionTokenResponse:
+    """Mints a short-lived token for the browser to use instead of the real
+    key — must be called with the real master key, never with another
+    token (minting from a token would let a leaked token mint itself new
+    tokens forever, defeating the expiry)."""
+    if x_api_key != settings.remote_api_key:
+        raise HTTPException(status_code=401, detail="invalid or missing X-API-Key")
+    token = secrets.token_urlsafe(24)
+    expires_at = datetime.now(timezone.utc) + SESSION_TOKEN_TTL
+    app.state.session_tokens[token] = expires_at
+    return SessionTokenResponse(token=token, expires_at=expires_at.isoformat())
 
 
 @app.post("/chat", response_model=ChatResponse)
@@ -308,6 +369,12 @@ async def chat(
         secs = parse_timer_seconds(req.message)
         name = parse_timer_name(req.message)
         return ChatResponse(reply=timer_reply(secs, name), timer_seconds=secs, timer_name=name)
+
+    if is_cooldown_trigger(req.message):
+        return ChatResponse(reply="Cool-down gestartet. 30 Minuten.")
+
+    if is_continue_query(req.message):
+        return ChatResponse(reply="Weiter.")
 
     beadchip_answer = beadchip_fastpath_answer(req.message)
     if beadchip_answer is not None:
@@ -369,6 +436,10 @@ async def voice(
         timer_seconds = parse_timer_seconds(transcript)
         timer_name = parse_timer_name(transcript)
         full = timer_reply(timer_seconds, timer_name)
+    elif is_cooldown_trigger(transcript):
+        full = "Cool-down gestartet. 30 Minuten."
+    elif is_continue_query(transcript):
+        full = "Weiter."
     elif beadchip_answer is not None:
         full = beadchip_answer
     else:

@@ -13,6 +13,18 @@ which goes through Streamlit's own Python server as usual: a plain
 components.html iframe has no channel back into Streamlit's session
 state, so the voice widget keeps its own small transcript rather than
 pretending to merge into the Python-side chat history below it.
+
+The widget is embedded via a SHORT-LIVED SESSION TOKEN, never the real
+JARVIS_REMOTE_API_KEY: this page is public once deployed to Streamlit
+Community Cloud, and the iframe's HTML (including whatever credential
+is baked into it) is visible in plain text to any visitor via view-source
+— no interaction needed. Python mints the token through POST /session-token
+(a normal server-side call, so the real key never reaches the browser for
+this either) and caches it in session_state keyed by (api_url, api_key),
+so the embedded HTML stays byte-identical across Streamlit reruns — that
+stability is what keeps the iframe (and its live countdown timers) from
+being torn down and recreated every time something elsewhere on the page
+triggers a rerun.
 """
 from __future__ import annotations
 
@@ -28,6 +40,31 @@ def _default(key: str, fallback: str = "") -> str:
         return str(st.secrets[key])
     except Exception:
         return fallback
+
+
+def get_voice_session_token(api_url: str, api_key: str) -> str | None:
+    """Mints (once) and caches a short-lived token scoped for the voice
+    widget, re-minting only when api_url/api_key actually change — minting
+    on every rerun would still be safe but would waste a round trip on
+    every typed chat message too."""
+    cache_key = (api_url, api_key)
+    cached = st.session_state.get("_voice_token_cache")
+    if cached and cached[0] == cache_key:
+        return cached[1]  # type: ignore[no-any-return]
+
+    try:
+        resp = requests.post(
+            f"{api_url.rstrip('/')}/session-token",
+            headers={"X-API-Key": api_key},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        token = resp.json()["token"]
+    except requests.RequestException:
+        return None
+
+    st.session_state["_voice_token_cache"] = (cache_key, token)
+    return token
 
 
 VOICE_WIDGET_HTML = r"""
@@ -132,6 +169,12 @@ VOICE_WIDGET_HTML = r"""
       border: 1px solid #2b8cff; border-radius: 999px; padding: 6px 18px;
       font-size: 12px; color: #9fe8c0; background: transparent; cursor: pointer;
     }
+    #cooldown-choice { display: none; gap: 10px; }
+    #cooldown-choice button {
+      border: 1px solid #ffb020; border-radius: 999px; padding: 8px 20px;
+      font-size: 13px; font-weight: 600; color: #ffb020; background: transparent;
+      cursor: pointer;
+    }
   </style>
   <div id="ring-wrap">
     <div id="ring-glow"></div>
@@ -141,6 +184,10 @@ VOICE_WIDGET_HTML = r"""
   <div id="timers"></div>
   <div id="status-line">Button oder Leertaste (Ring anklicken) halten zum Sprechen</div>
   <div id="hint-line"></div>
+  <div id="cooldown-choice">
+    <button id="choice-tecan" type="button">Timer Tecan (2:43:00)</button>
+    <button id="choice-bioroboter" type="button">Timer Bioroboter (2:55:00)</button>
+  </div>
   <button id="play-fallback" type="button" style="display:none;">▶️ Antwort abspielen</button>
   <div id="transcript"></div>
 
@@ -154,6 +201,10 @@ VOICE_WIDGET_HTML = r"""
     const talkBtn = document.getElementById("talk-btn");
     const playFallback = document.getElementById("play-fallback");
     const timersEl = document.getElementById("timers");
+    const hintLine = document.getElementById("hint-line");
+    const choiceEl = document.getElementById("cooldown-choice");
+    const choiceTecanBtn = document.getElementById("choice-tecan");
+    const choiceBioroboterBtn = document.getElementById("choice-bioroboter");
 
     // Real animal recordings (verified Wikimedia Commons .ogg files) mixed
     // with speech-synthesized meme alarm lines — using the browser's own
@@ -213,8 +264,8 @@ VOICE_WIDGET_HTML = r"""
       });
     }
 
-    function addTimer(totalSeconds, name) {
-      timers.push({ id: ++timerIdSeq, remaining: totalSeconds, name: name || null });
+    function addTimer(totalSeconds, name, onComplete) {
+      timers.push({ id: ++timerIdSeq, remaining: totalSeconds, name: name || null, onComplete: onComplete || null });
       renderTimers();
     }
 
@@ -223,14 +274,110 @@ VOICE_WIDGET_HTML = r"""
       const fired = [];
       timers.forEach((t) => {
         t.remaining -= 1;
-        if (t.remaining <= 0) fired.push(t.id);
+        if (t.remaining <= 0) fired.push(t);
       });
       if (fired.length > 0) {
-        fired.forEach(() => playRandomAlarm());
-        timers = timers.filter((t) => !fired.includes(t.id));
+        const firedIds = fired.map((t) => t.id);
+        timers = timers.filter((t) => !firedIds.includes(t.id));
+        // onComplete (cooldown steps) runs instead of the random alarm —
+        // each step speaks its own cue or chains the next step itself.
+        fired.forEach((t) => (t.onComplete ? t.onComplete() : playRandomAlarm()));
       }
       renderTimers();
     }, 1000);
+
+    // --- "Cool down" lab-protocol macro -------------------------------
+    // Entirely client-side, triggered only by matching the transcript
+    // text of a /voice response — the server has no notion of this
+    // workflow (see is_cooldown_trigger/is_continue_query in
+    // remote_api.py, which exist only so "cool down"/"weiter" don't
+    // waste an LLM call and get an irrelevant answer spoken aloud).
+    // Fixed named sequence per the lab protocol: 30 min cooldown -> (x3
+    // "Beadchips jetzt rausnehmen") -> [weiter] -> Chip Wash 1 (1 min) ->
+    // Chip Bath 1 (1 min) -> [weiter] -> Chip Wash 2 (1 min) -> Chip Bath
+    // 2 (1 min) -> choose Tecan (2:43:00) or Bioroboter (2:55:00) -> (x3
+    // "Ready for Rumble").
+    const COOLDOWN_TRIGGER_RE = /c+o{2,4}l\s*down/i;
+    const CONTINUE_RE = /\bweiter\b/i;
+    let cooldown = null; // { waitingForContinue: false | "wash1" | "wash2" }
+
+    function cooldownHint(text) {
+      hintLine.textContent = text || "";
+    }
+
+    function speakRepeated(text, lang, times, onDone) {
+      if (!window.speechSynthesis) { if (onDone) onDone(); return; }
+      let said = 0;
+      function speakOnce() {
+        try {
+          const utter = new SpeechSynthesisUtterance(text);
+          utter.lang = lang;
+          utter.rate = 0.95;
+          utter.onend = () => {
+            said += 1;
+            if (said < times) setTimeout(speakOnce, 500);
+            else if (onDone) onDone();
+          };
+          window.speechSynthesis.speak(utter);
+        } catch (e) {
+          if (onDone) onDone(); // speech synthesis unavailable — don't get stuck
+        }
+      }
+      speakOnce();
+    }
+
+    function startCooldown() {
+      if (cooldown) return; // already running — ignore a repeated trigger
+      cooldown = { waitingForContinue: false };
+      cooldownHint("Cool-down läuft: 30 Minuten");
+      addTimer(30 * 60, "Cool Down", () => {
+        speakRepeated("Beadchips jetzt rausnehmen", "de-DE", 3, () => {
+          cooldown.waitingForContinue = "wash1";
+          cooldownHint("Sage 'weiter' für Chip Wash 1");
+        });
+      });
+    }
+
+    function startChipWash1() {
+      cooldownHint("");
+      addTimer(60, "Chip Wash 1", startChipBath1);
+    }
+    function startChipBath1() {
+      addTimer(60, "Chip Bath 1", () => {
+        cooldown.waitingForContinue = "wash2";
+        cooldownHint("Sage 'weiter' für Chip Wash 2");
+      });
+    }
+    function startChipWash2() {
+      cooldownHint("");
+      addTimer(60, "Chip Wash 2", startChipBath2);
+    }
+    function startChipBath2() {
+      addTimer(60, "Chip Bath 2", () => {
+        cooldownHint("Wähle: Tecan oder Bioroboter");
+        choiceEl.style.display = "flex";
+      });
+    }
+
+    function startInstrumentTimer(label, seconds) {
+      choiceEl.style.display = "none";
+      cooldownHint("");
+      addTimer(seconds, label, () => {
+        speakRepeated("Ready for Rumble", "en-US", 3, () => {
+          cooldown = null; // workflow complete
+        });
+      });
+    }
+    choiceTecanBtn.addEventListener("click", () => startInstrumentTimer("Timer Tecan", 2 * 3600 + 43 * 60));
+    choiceBioroboterBtn.addEventListener("click", () => startInstrumentTimer("Timer Bioroboter", 2 * 3600 + 55 * 60));
+
+    function handleCooldownContinue() {
+      if (!cooldown || !cooldown.waitingForContinue) return;
+      const next = cooldown.waitingForContinue;
+      cooldown.waitingForContinue = false;
+      if (next === "wash1") startChipWash1();
+      else if (next === "wash2") startChipWash2();
+    }
 
     let mediaStream = null;
     let recorder = null;
@@ -361,6 +508,8 @@ VOICE_WIDGET_HTML = r"""
           addLine("you", body.transcript);
           addLine("jarvis", body.reply);
           if (body.timer_seconds) addTimer(body.timer_seconds, body.timer_name);
+          if (COOLDOWN_TRIGGER_RE.test(body.transcript)) startCooldown();
+          else if (CONTINUE_RE.test(body.transcript)) handleCooldownContinue();
           setState("speaking");
 
           if (body.audio_base64) {
@@ -434,9 +583,11 @@ VOICE_WIDGET_HTML = r"""
 """
 
 
-def render_voice_widget(api_url: str, api_key: str) -> None:
+def render_voice_widget(api_url: str, voice_token: str) -> None:
+    # voice_token is a short-lived /session-token value, never the real
+    # JARVIS_REMOTE_API_KEY — see the module docstring for why.
     html = VOICE_WIDGET_HTML.replace("__API_URL__", api_url.replace('"', "")).replace(
-        "__API_KEY__", api_key.replace('"', "")
+        "__API_KEY__", voice_token.replace('"', "")
     )
     components.html(html, height=380)
 
@@ -464,7 +615,17 @@ with st.sidebar:
 
 st.title("🤖 Jeanny")
 
-render_voice_widget(api_url, api_key)
+if api_url and api_key:
+    voice_token = get_voice_session_token(api_url, api_key)
+    if voice_token:
+        render_voice_widget(api_url, voice_token)
+    else:
+        st.warning(
+            "Konnte kein Sitzungs-Token für das Sprach-Widget holen — "
+            "Tunnel/API-Key prüfen. Getippter Chat unten geht trotzdem."
+        )
+else:
+    st.info("API-URL und API-Key in der Sidebar eintragen, um das Sprach-Widget zu nutzen.")
 
 st.caption(
     "Sprache läuft direkt im Widget oben (Leertaste halten). "
