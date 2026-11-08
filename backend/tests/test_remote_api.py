@@ -1,5 +1,6 @@
 """Remote chat/voice API tests. Uses Fake* backends injected onto
 app.state — never hits real Ollama/cloud/Whisper/TTS."""
+import asyncio
 import base64
 import re
 
@@ -585,6 +586,47 @@ async def test_generate_game_escalates_to_xlarge_after_smoke_check_failure(monke
     await remote_api._generate_game("tetris")
     assert (tmp_path / "tetris.html").read_text(encoding="utf-8") == _VALID_GAME_HTML
     assert remote_api._read_progress("tetris")["status"] == "done"
+
+
+async def test_xlarge_escalation_never_runs_concurrently(client, monkeypatch, tmp_path):
+    """Regression for the resource-exhaustion finding: two games failing
+    their smoke-check around the same time must not both load the
+    xlarge model at once — this machine has already OOM-killed it twice
+    under normal (single) load."""
+    from jarvis import remote_api
+    from jarvis.llm import FakeLlm, LlmEvent
+
+    monkeypatch.setattr(remote_api.settings, "games_dir", tmp_path)
+
+    broken_game = (
+        "<html><body><canvas id='c' width='320' height='640'></canvas>"
+        "<script>const g = Array(320 / 30);</script></body></html>"
+    )
+    remote_api.app.state.game_llm = FakeLlm(["```html\n" + broken_game + "\n```"])
+
+    concurrent_count = 0
+    max_concurrent = 0
+
+    class SlowFakeLlm:
+        async def chat(self, messages):
+            nonlocal concurrent_count, max_concurrent
+            concurrent_count += 1
+            max_concurrent = max(max_concurrent, concurrent_count)
+            await asyncio.sleep(0.05)
+            concurrent_count -= 1
+            yield LlmEvent(kind="chunk", text="```html\n" + _VALID_GAME_HTML + "\n```")
+            yield LlmEvent(kind="done", text="```html\n" + _VALID_GAME_HTML + "\n```")
+
+    remote_api.app.state.game_llm_xlarge = SlowFakeLlm()
+
+    await asyncio.gather(
+        remote_api._generate_game("tetris"),
+        remote_api._generate_game("pacman"),
+    )
+
+    assert max_concurrent == 1
+    assert remote_api._read_progress("tetris")["status"] == "done"
+    assert remote_api._read_progress("pacman")["status"] == "done"
 
 
 async def test_generate_game_clears_in_flight_flag_when_done(monkeypatch, tmp_path):

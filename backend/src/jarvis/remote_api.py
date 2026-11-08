@@ -171,6 +171,15 @@ app.state.game_llm_xlarge = RealLlm(
     timeout_s=settings.llm_timeout_s,
     max_tokens=settings.game_max_tokens,
 )
+# Process-wide, not per-game — this machine has already OOM-killed the
+# xlarge model twice under normal load (see coding_model's comment in
+# config.py); several games failing their smoke-check around the same
+# time (plausible: a transient Ollama hiccup affects all of them) must
+# not escalate concurrently and multiply that memory pressure. A
+# second game's escalation just waits for the first's xlarge attempt
+# to finish rather than starting its own in parallel — still serves
+# everyone eventually, just never more than one 32b load at a time.
+app.state.xlarge_lock = asyncio.Lock()
 
 # Short-lived tokens so the browser never has to carry the real master
 # key. The Streamlit frontend's voice widget runs entirely client-side
@@ -657,14 +666,26 @@ async def _generate_game(game: str) -> None:
             )
             write_progress(
                 progress_path,
-                status="generating",
+                status="escalation_queued",
                 tokens=0,
                 max_tokens=settings.game_max_tokens,
                 model=settings.game_model_xlarge,
             )
-            html = await _attempt_generation(
-                game, app.state.game_llm_xlarge, settings.game_model_xlarge, progress_path
-            )
+            # At most one xlarge generation process-wide at a time — see
+            # the lock's own comment above for why. A second game
+            # failing around the same time waits here rather than
+            # starting its own concurrent 32b load.
+            async with app.state.xlarge_lock:
+                write_progress(
+                    progress_path,
+                    status="generating",
+                    tokens=0,
+                    max_tokens=settings.game_max_tokens,
+                    model=settings.game_model_xlarge,
+                )
+                html = await _attempt_generation(
+                    game, app.state.game_llm_xlarge, settings.game_model_xlarge, progress_path
+                )
         if html is None:
             write_progress(progress_path, status="error", error="generation_failed_smoke_check")
             return

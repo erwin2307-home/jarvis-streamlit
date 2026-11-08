@@ -150,77 +150,103 @@ def extract_script_body(html: str) -> str | None:
 # substituted, as a json.dumps()'d string (same safe-escaping approach
 # as coding.py's save_launcher) so it can contain anything (quotes,
 # backslashes, template literals) without breaking the harness around
-# it. Runs the script in a Node `vm` context exposing only these stubs
-# — no `require`, `process`, `fs`, or real `document`/`window` — so
-# even a malicious or wildly buggy generated script can't do anything
-# beyond throwing inside this sandbox. `setTimeout`/`requestAnimationFrame`
-# queue callbacks instead of actually scheduling them; the harness then
-# drains a bounded number of them itself to exercise a few ticks of the
-# game's own loop, which is what actually catches a bug that only shows
-# up once gameplay starts (not just at parse time).
-_SMOKE_HARNESS_TEMPLATE = """
-"use strict";
-const vm = require("vm");
-
-const GAME_SCRIPT = __SCRIPT_JSON__;
-
+# it.
+#
+# IMPORTANT: Node's `vm` module is explicitly NOT a security boundary
+# (Node's own docs: "The vm module is not a security mechanism. Do not
+# use it to run untrusted code.") — an earlier version of this harness
+# passed real host objects (console, Math, Array, ...) into the
+# sandboxed context, which is the actual documented escape: any host
+# object's `.constructor.constructor` resolves back to the HOST
+# realm's Function constructor (e.g. generated code could have run
+# `console.constructor.constructor("return process")()` to reach the
+# real `process`, with real filesystem/network/process access). Fixed
+# by creating a context with NO injected object graph at all
+# (`vm.createContext()`, no argument) and defining every stub —
+# document, window, setTimeout, console, etc. — from source TEXT run
+# inside that context (the `_BOOTSTRAP` script below), so nothing the
+# generated script can reach has a prototype chain leading back to
+# this (host) realm. This closes the specific named escape; it is
+# still "best-effort hardening" per Node's own caveat, not an absolute
+# guarantee against a sufficiently creative escape — if this pipeline
+# ever needs to run genuinely adversarial, untrusted input (it
+# currently only runs this project's own local Ollama model's output),
+# a real OS-level sandbox (container/VM, no network, read-only FS)
+# would be the correct upgrade. `setTimeout`/`requestAnimationFrame`
+# queue callbacks instead of actually scheduling them; a second,
+# separate run drains a bounded number of them to exercise a few ticks
+# of the game's own loop, which is what actually catches a bug that
+# only shows up once gameplay starts (not just at parse time).
+_BOOTSTRAP = """
 function makeStubElement() {
-  const ctx2d = {
-    clearRect(){}, fillRect(){}, strokeRect(){}, fillText(){}, strokeText(){},
-    beginPath(){}, closePath(){}, arc(){}, moveTo(){}, lineTo(){}, stroke(){},
-    fill(){}, save(){}, restore(){}, translate(){}, rotate(){}, scale(){},
-    drawImage(){}, measureText(){ return { width: 0 }; },
-    fillStyle: "", strokeStyle: "", font: "", textAlign: "", lineWidth: 1,
+  var ctx2d = {
+    clearRect: function(){}, fillRect: function(){}, strokeRect: function(){},
+    fillText: function(){}, strokeText: function(){}, beginPath: function(){},
+    closePath: function(){}, arc: function(){}, moveTo: function(){},
+    lineTo: function(){}, stroke: function(){}, fill: function(){},
+    save: function(){}, restore: function(){}, translate: function(){},
+    rotate: function(){}, scale: function(){}, drawImage: function(){},
+    measureText: function(){ return { width: 0 }; },
+    fillStyle: "", strokeStyle: "", font: "", textAlign: "", lineWidth: 1
   };
   return {
     style: {}, textContent: "", width: 800, height: 600, children: [],
-    getContext(){ return ctx2d; },
-    getBoundingClientRect(){ return { left: 0, top: 0, width: 800, height: 600 }; },
-    addEventListener(){}, removeEventListener(){}, appendChild(){}, focus(){},
-    setAttribute(){}, remove(){},
+    getContext: function(){ return ctx2d; },
+    getBoundingClientRect: function(){ return { left: 0, top: 0, width: 800, height: 600 }; },
+    addEventListener: function(){}, removeEventListener: function(){},
+    appendChild: function(){}, focus: function(){}, setAttribute: function(){},
+    remove: function(){}
   };
 }
-
-const _elements = {};
-const _timers = [];
-
-const sandbox = {
-  console, Math, JSON, Array, Object, String, Number, Boolean, Date, Map, Set,
-  document: {
-    getElementById(id) { if (!_elements[id]) _elements[id] = makeStubElement(); return _elements[id]; },
-    createElement() { return makeStubElement(); },
-    addEventListener() {},
-    removeEventListener() {},
-    body: makeStubElement(),
-  },
-  window: null, // set below to close over `sandbox` itself, like a real global object does
-  navigator: { userAgent: "smoke-check" },
-  alert() {}, confirm() { return true; }, prompt() { return ""; },
-  setTimeout(fn) { _timers.push(fn); return _timers.length; },
-  clearTimeout() {},
-  setInterval(fn) { _timers.push(fn); return _timers.length; },
-  clearInterval() {},
-  requestAnimationFrame(fn) { _timers.push(fn); return _timers.length; },
-  cancelAnimationFrame() {},
+var _elements = {};
+var _timers = [];
+var document = {
+  getElementById: function(id) { if (!_elements[id]) _elements[id] = makeStubElement(); return _elements[id]; },
+  createElement: function() { return makeStubElement(); },
+  addEventListener: function() {},
+  removeEventListener: function() {},
+  body: makeStubElement()
 };
-sandbox.window = sandbox;
-
-let exitCode = 0;
-try {
-  vm.createContext(sandbox);
-  vm.runInContext(GAME_SCRIPT, sandbox, { timeout: 4000, filename: "generated-game.js" });
-  for (let i = 0; i < 300 && _timers.length; i++) {
-    const fn = _timers.shift();
+var navigator = { userAgent: "smoke-check" };
+var console = { log: function(){}, warn: function(){}, error: function(){}, info: function(){} };
+function alert() {}
+function confirm() { return true; }
+function prompt() { return ""; }
+function setTimeout(fn) { _timers.push(fn); return _timers.length; }
+function clearTimeout() {}
+function setInterval(fn) { _timers.push(fn); return _timers.length; }
+function clearInterval() {}
+function requestAnimationFrame(fn) { _timers.push(fn); return _timers.length; }
+function cancelAnimationFrame() {}
+var window = globalThis;
+function __drainTimers() {
+  for (var i = 0; i < 300 && _timers.length; i++) {
+    var fn = _timers.shift();
     fn();
   }
-  console.log("SMOKE_OK");
-} catch (e) {
-  console.error("SMOKE_FAIL: " + (e && e.message ? e.message : String(e)));
-  exitCode = 1;
 }
-process.exit(exitCode);
 """
 
 
 def build_smoke_harness(script_body: str) -> str:
-    return _SMOKE_HARNESS_TEMPLATE.replace("__SCRIPT_JSON__", json.dumps(script_body))
+    bootstrap_json = json.dumps(_BOOTSTRAP)
+    script_json = json.dumps(script_body)
+    return (
+        '"use strict";\n'
+        'const vm = require("vm");\n'
+        f"const BOOTSTRAP = {bootstrap_json};\n"
+        f"const GAME_SCRIPT = {script_json};\n"
+        "\n"
+        "const context = vm.createContext();\n"
+        "let exitCode = 0;\n"
+        "try {\n"
+        '  vm.runInContext(BOOTSTRAP, context, { timeout: 2000, filename: "smoke-bootstrap.js" });\n'
+        '  vm.runInContext(GAME_SCRIPT, context, { timeout: 4000, filename: "generated-game.js" });\n'
+        '  vm.runInContext("__drainTimers()", context, { timeout: 4000, filename: "smoke-drain.js" });\n'
+        '  console.log("SMOKE_OK");\n'
+        "} catch (e) {\n"
+        '  console.error("SMOKE_FAIL: " + (e && e.message ? e.message : String(e)));\n'
+        "  exitCode = 1;\n"
+        "}\n"
+        "process.exit(exitCode);\n"
+    )

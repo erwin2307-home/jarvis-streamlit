@@ -199,3 +199,47 @@ def test_smoke_check_sandbox_has_no_require_or_process_access(tmp_path) -> None:
     assert result.returncode != 0
     assert "SMOKE_FAIL" in result.stderr
     assert "not defined" in result.stderr  # ReferenceError: require is not defined
+
+
+@_requires_node
+def test_smoke_check_sandbox_blocks_constructor_chain_escape(tmp_path) -> None:
+    # The specific documented Node `vm` escape: a HOST object's
+    # `.constructor.constructor` resolves to the host realm's Function
+    # constructor, letting sandboxed code mint a function that runs
+    # with host privileges (e.g. to reach `process`/fs/network). This
+    # only works if a host-realm object crosses into the sandbox — the
+    # fix (vm.createContext() with nothing injected, every stub built
+    # from source text run inside the context) means even a plain
+    # object literal created *inside* the sandbox has the *sandboxed*
+    # realm's Function as its constructor, not this host process's.
+    script = (
+        "var hostProcess = ({}).constructor.constructor('return process')();\n"
+        "hostProcess.exit(0);\n"  # if this ever runs, it kills THIS test's node process with code 0
+    )
+    harness_path = tmp_path / "harness.js"
+    harness_path.write_text(build_smoke_harness(script), encoding="utf-8")
+    result = subprocess.run(["node", str(harness_path)], capture_output=True, text=True, timeout=15)
+    assert result.returncode != 0, (
+        "escape succeeded — generated code reached the host `process` object"
+    )
+    assert "SMOKE_FAIL" in result.stderr
+
+
+@_requires_node
+def test_smoke_check_sandbox_blocks_the_exact_proven_console_escape(tmp_path) -> None:
+    # This is the exploit confirmed to actually work against the
+    # earlier, vulnerable version of this harness (which passed the
+    # real host `console` object into the sandbox): run against that
+    # old pattern directly, `console.constructor.constructor('return
+    # process')().exit(42)` terminates the real host process with code
+    # 42 — proven live, not theoretical. The fixed harness's `console`
+    # is a fresh object built entirely from bootstrap source text run
+    # inside the sandboxed context, so its constructor chain never
+    # leaves that context.
+    script = "console.constructor.constructor('return process')().exit(42);"
+    harness_path = tmp_path / "harness.js"
+    harness_path.write_text(build_smoke_harness(script), encoding="utf-8")
+    result = subprocess.run(["node", str(harness_path)], capture_output=True, text=True, timeout=15)
+    assert result.returncode != 42, "escape succeeded — reached and called host process.exit"
+    assert result.returncode != 0
+    assert "SMOKE_FAIL" in result.stderr
