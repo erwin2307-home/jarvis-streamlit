@@ -234,6 +234,20 @@ class Settings(BaseModel):
             os.getenv("JARVIS_GAMES_DIR", str(Path.home() / "Desktop" / "Jarvis_Games"))
         )
     )
+    # Generated games are smoke-checked in a sandboxed Node subprocess
+    # before being marked "done" (see games.py's build_smoke_harness) —
+    # a real bug shipped in practice (canvas-size/block-size mismatch
+    # throwing on load) that this would have caught automatically. On a
+    # smoke-check failure, ONE escalation attempt is made with a bigger
+    # model before giving up — not the default, only a failure fallback,
+    # since this machine already OOM-killed qwen2.5-coder:32b twice
+    # under normal load (see coding_model's comment above).
+    game_model_xlarge: str = Field(
+        default_factory=lambda: os.getenv("JARVIS_GAME_MODEL_XLARGE", "qwen2.5-coder:32b")
+    )
+    game_smoke_timeout_s: float = Field(
+        default_factory=lambda: float(os.getenv("JARVIS_GAME_SMOKE_TIMEOUT_S", "15.0"))
+    )
 
     # Remote text-chat API (remote_api.py) — a separate, minimal FastAPI
     # app meant to be tunneled to the public internet so a Streamlit

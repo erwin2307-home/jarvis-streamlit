@@ -240,6 +240,7 @@ VOICE_WIDGET_HTML = r"""
     <button id="game-tetris" type="button">Tetris</button>
     <button id="game-pacman" type="button">Pac-Man</button>
     <button id="game-aliens" type="button">Aliens</button>
+    <button id="game-halo" type="button">Halo</button>
   </div>
   <div id="timers"></div>
   <div id="status-line">Button oder Leertaste (Ring anklicken) halten zum Sprechen</div>
@@ -268,6 +269,7 @@ VOICE_WIDGET_HTML = r"""
     const gameTetrisBtn = document.getElementById("game-tetris");
     const gamePacmanBtn = document.getElementById("game-pacman");
     const gameAliensBtn = document.getElementById("game-aliens");
+    const gameHaloBtn = document.getElementById("game-halo");
     const playFallback = document.getElementById("play-fallback");
     const timersEl = document.getElementById("timers");
     const hintLine = document.getElementById("hint-line");
@@ -538,6 +540,7 @@ VOICE_WIDGET_HTML = r"""
     gameTetrisBtn.addEventListener("click", () => playGame("tetris", "Tetris"));
     gamePacmanBtn.addEventListener("click", () => playGame("pacman", "Pac-Man"));
     gameAliensBtn.addEventListener("click", () => playGame("aliens", "Aliens"));
+    gameHaloBtn.addEventListener("click", () => playGame("halo", "Halo"));
 
     function handleCooldownContinue() {
       if (!cooldown || !cooldown.waitingForContinue) return;
@@ -766,11 +769,12 @@ def render_voice_widget(api_url: str, voice_token: str) -> None:
     html = VOICE_WIDGET_HTML.replace("__API_URL__", api_url.replace('"', "")).replace(
         "__API_KEY__", voice_token.replace('"', "")
     )
-    # 520, not 380 — Cool Down + Spiele buttons (plus the Tetris/Pac-Man/
-    # Aliens reveal row) added below talk-btn pushed the flex column
-    # taller; components.html doesn't auto-size or scroll, so anything
-    # past the fixed height gets silently clipped.
-    components.html(html, height=520)
+    # 540, not 380 — Cool Down + Spiele buttons (plus the Tetris/Pac-Man/
+    # Aliens/Halo reveal row, which can wrap to two lines on a narrow
+    # viewport) added below talk-btn pushed the flex column taller;
+    # components.html doesn't auto-size or scroll, so anything past the
+    # fixed height gets silently clipped.
+    components.html(html, height=540)
 
 
 # API_KEY and API_URL come ONLY from st.secrets — never from a widget.

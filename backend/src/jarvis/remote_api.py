@@ -21,6 +21,7 @@ import io
 import json
 import re
 import secrets
+import tempfile
 from datetime import datetime, timedelta, timezone
 from fractions import Fraction
 from pathlib import Path
@@ -37,7 +38,14 @@ from pydantic import BaseModel
 from jarvis import __version__
 from jarvis.coding import progress_path_for, write_progress
 from jarvis.config import get_settings
-from jarvis.games import GAME_IDS, GAMES_SYSTEM_PROMPT, extract_html_game, game_prompt
+from jarvis.games import (
+    GAME_IDS,
+    GAMES_SYSTEM_PROMPT,
+    build_smoke_harness,
+    extract_html_game,
+    extract_script_body,
+    game_prompt,
+)
 from jarvis.llm import (
     HybridLlm,
     Llm,
@@ -147,6 +155,18 @@ app.state.tts = _build_tts()
 app.state.game_llm = RealLlm(
     host=settings.llm_host,
     model=settings.coding_model,
+    system_prompt=GAMES_SYSTEM_PROMPT,
+    timeout_s=settings.llm_timeout_s,
+    max_tokens=settings.game_max_tokens,
+)
+# Escalation-only fallback (see games.py's module docstring + the
+# smoke-check below) — never used by default, only when the normal
+# attempt's output fails the sandboxed smoke-check. RealLlm's __init__
+# doesn't eagerly load the model into Ollama, so constructing this
+# unconditionally costs nothing unless it's actually used.
+app.state.game_llm_xlarge = RealLlm(
+    host=settings.llm_host,
+    model=settings.game_model_xlarge,
     system_prompt=GAMES_SYSTEM_PROMPT,
     timeout_s=settings.llm_timeout_s,
     max_tokens=settings.game_max_tokens,
@@ -535,6 +555,86 @@ def _read_progress(game: str) -> dict[str, object]:
         return {}
 
 
+async def _run_smoke_check(html: str) -> str | None:
+    """None if the generated game's script ran a few ticks in a sandboxed
+    Node `vm` context (no require/process/filesystem access — see
+    games.py's build_smoke_harness) without throwing; otherwise a short
+    diagnostic string for the server log only (never reflected to a
+    caller — _generate_game below only ever writes a fixed error code to
+    the progress file, same reasoning as its own exception handler)."""
+    script = extract_script_body(html)
+    if script is None:
+        return "no_script_tag"
+    harness = build_smoke_harness(script)
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".js", delete=False, encoding="utf-8"
+        ) as f:
+            f.write(harness)
+            harness_path = f.name
+    except OSError as exc:
+        return f"could_not_write_harness: {exc!r}"
+    try:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "node",
+                harness_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            # node isn't installed on this machine — degrade gracefully
+            # rather than permanently blocking every game generation on
+            # an optional quality check.
+            logger.warning("games: node not found on PATH, skipping smoke-check")
+            return None
+        try:
+            _, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=settings.game_smoke_timeout_s
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return "smoke_check_timed_out"
+        if proc.returncode != 0:
+            return stderr.decode("utf-8", errors="replace")[:500]
+        return None
+    finally:
+        Path(harness_path).unlink(missing_ok=True)
+
+
+async def _attempt_generation(
+    game: str, llm: Llm, model_name: str, progress_path: Path
+) -> str | None:
+    """One end-to-end try with one model: generate, extract, smoke-check.
+    Returns the verified html, or None if anything about this attempt
+    failed (caller decides whether to escalate or give up)."""
+    full = ""
+    async for ev in llm.chat([{"role": "user", "content": game_prompt(game)}]):
+        if ev.kind == "chunk":
+            full += ev.text
+            write_progress(
+                progress_path,
+                status="generating",
+                tokens=len(full) // 4,
+                max_tokens=settings.game_max_tokens,
+                model=model_name,
+            )
+        elif ev.kind == "done":
+            full = ev.text or full
+    html = extract_html_game(full)
+    if html is None:
+        logger.warning(f"games: model produced no valid game for {game!r} (model={model_name})")
+        return None
+    smoke_error = await _run_smoke_check(html)
+    if smoke_error is not None:
+        logger.warning(
+            f"games: smoke-check failed for {game!r} (model={model_name}): {smoke_error}"
+        )
+        return None
+    return html
+
+
 async def _generate_game(game: str) -> None:
     progress_path = _game_progress_path(game)
     write_progress(
@@ -545,24 +645,28 @@ async def _generate_game(game: str) -> None:
         model=settings.coding_model,
     )
     try:
-        game_llm: Llm = app.state.game_llm
-        full = ""
-        async for ev in game_llm.chat([{"role": "user", "content": game_prompt(game)}]):
-            if ev.kind == "chunk":
-                full += ev.text
-                write_progress(
-                    progress_path,
-                    status="generating",
-                    tokens=len(full) // 4,
-                    max_tokens=settings.game_max_tokens,
-                    model=settings.coding_model,
-                )
-            elif ev.kind == "done":
-                full = ev.text or full
-        html = extract_html_game(full)
+        html = await _attempt_generation(game, app.state.game_llm, settings.coding_model, progress_path)
         if html is None:
-            logger.warning(f"games: model produced no valid game for {game!r}")
-            write_progress(progress_path, status="error", error="no_valid_game_in_response")
+            # Escalation only on failure, never by default — this
+            # machine has already OOM-killed the xlarge model under
+            # normal load (see config.py's comment), so it's a last
+            # resort, not a routine upgrade.
+            logger.info(
+                f"games: {game!r} failed with {settings.coding_model}, "
+                f"escalating to {settings.game_model_xlarge}"
+            )
+            write_progress(
+                progress_path,
+                status="generating",
+                tokens=0,
+                max_tokens=settings.game_max_tokens,
+                model=settings.game_model_xlarge,
+            )
+            html = await _attempt_generation(
+                game, app.state.game_llm_xlarge, settings.game_model_xlarge, progress_path
+            )
+        if html is None:
+            write_progress(progress_path, status="error", error="generation_failed_smoke_check")
             return
         settings.games_dir.mkdir(parents=True, exist_ok=True)
         # Temp-file-then-replace, same reasoning as write_progress's own

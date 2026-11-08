@@ -1,11 +1,23 @@
 """Tests for the browser-game generation prompts + extraction."""
+import shutil
+import subprocess
+
 import pytest
 
-from jarvis.games import GAME_IDS, extract_html_game, game_prompt
+from jarvis.games import (
+    GAME_IDS,
+    build_smoke_harness,
+    extract_html_game,
+    extract_script_body,
+    game_prompt,
+)
+
+_HAS_NODE = shutil.which("node") is not None
+_requires_node = pytest.mark.skipif(not _HAS_NODE, reason="node not on PATH")
 
 
-def test_game_ids_are_the_three_requested_games() -> None:
-    assert set(GAME_IDS) == {"tetris", "pacman", "aliens"}
+def test_game_ids_are_the_four_requested_games() -> None:
+    assert set(GAME_IDS) == {"tetris", "pacman", "aliens", "halo"}
 
 
 def test_game_prompt_returns_nonempty_text_for_every_game() -> None:
@@ -30,6 +42,12 @@ def test_aliens_prompt_mentions_spaceship_and_aliens() -> None:
     prompt = game_prompt("aliens")
     assert "Raumschiff" in prompt
     assert "Alien" in prompt
+
+
+def test_halo_prompt_scopes_down_to_2d_not_3d() -> None:
+    prompt = game_prompt("halo")
+    assert "2D" in prompt
+    assert "KEIN 3D" in prompt
 
 
 def _wrap(body: str, fence: str = "```html") -> str:
@@ -89,3 +107,95 @@ def test_extract_html_game_rejects_invalid_syntax_fence_tag() -> None:
     # extract_python_code — rejects e.g. ```javascript slipping through.
     response = "```javascript\n" + _VALID_GAME + "\n```"
     assert extract_html_game(response) is None
+
+
+# --- Smoke-check harness (actually runs the generated JS, sandboxed) --
+
+
+def test_extract_script_body_pulls_single_script_tag() -> None:
+    html = "<html><body><canvas></canvas><script>let x = 1;</script></body></html>"
+    assert extract_script_body(html) == "let x = 1;"
+
+
+def test_extract_script_body_concatenates_multiple_script_tags() -> None:
+    html = (
+        "<html><body><canvas></canvas>"
+        "<script>let a = 1;</script>"
+        "<script>let b = 2;</script>"
+        "</body></html>"
+    )
+    body = extract_script_body(html)
+    assert body is not None
+    assert "let a = 1;" in body
+    assert "let b = 2;" in body
+
+
+def test_extract_script_body_returns_none_without_any_script_tag() -> None:
+    assert extract_script_body("<html><body><canvas></canvas></body></html>") is None
+
+
+def test_build_smoke_harness_embeds_script_as_safe_json_string() -> None:
+    harness = build_smoke_harness('alert("quotes \' and \\\\ backslashes");')
+    assert '\\"quotes' in harness or "quotes" in harness  # survived json.dumps escaping
+    assert "require(\"vm\")" in harness
+
+
+@_requires_node
+def test_smoke_check_passes_for_a_working_script(tmp_path) -> None:
+    script = (
+        "let ticks = 0;\n"
+        "function tick() { ticks++; if (ticks < 5) setTimeout(tick, 1); }\n"
+        "tick();\n"
+    )
+    harness_path = tmp_path / "harness.js"
+    harness_path.write_text(build_smoke_harness(script), encoding="utf-8")
+    result = subprocess.run(["node", str(harness_path)], capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0
+    assert "SMOKE_OK" in result.stdout
+
+
+@_requires_node
+def test_smoke_check_fails_on_invalid_array_length(tmp_path) -> None:
+    # The real bug that shipped: canvas dimensions not evenly divisible
+    # by the block size, so `Array(10.667)` throws RangeError on load,
+    # before the game ever does anything — exactly what this harness is
+    # for catching automatically instead of a human spotting "nothing
+    # happens" in a real browser.
+    script = "const grid = Array(320 / 30);\n"
+    harness_path = tmp_path / "harness.js"
+    harness_path.write_text(build_smoke_harness(script), encoding="utf-8")
+    result = subprocess.run(["node", str(harness_path)], capture_output=True, text=True, timeout=15)
+    assert result.returncode != 0
+    assert "SMOKE_FAIL" in result.stderr
+
+
+@_requires_node
+def test_smoke_check_fails_on_crash_during_simulated_game_loop(tmp_path) -> None:
+    # Catches a bug that only manifests once the loop actually runs a
+    # few ticks (the harness drains queued setTimeout/rAF callbacks),
+    # not just at parse/first-line time.
+    script = (
+        "let obj = null;\n"
+        "function tick() { obj.missing(); }\n"
+        "setTimeout(tick, 1);\n"
+    )
+    harness_path = tmp_path / "harness.js"
+    harness_path.write_text(build_smoke_harness(script), encoding="utf-8")
+    result = subprocess.run(["node", str(harness_path)], capture_output=True, text=True, timeout=15)
+    assert result.returncode != 0
+    assert "SMOKE_FAIL" in result.stderr
+
+
+@_requires_node
+def test_smoke_check_sandbox_has_no_require_or_process_access(tmp_path) -> None:
+    # The whole point of running this in a vm context instead of plain
+    # node: the generated script itself must not be able to reach
+    # require/process/filesystem, even though the harness around it
+    # (outside the sandbox) does.
+    script = "require('fs').readFileSync('/etc/hosts');"
+    harness_path = tmp_path / "harness.js"
+    harness_path.write_text(build_smoke_harness(script), encoding="utf-8")
+    result = subprocess.run(["node", str(harness_path)], capture_output=True, text=True, timeout=15)
+    assert result.returncode != 0
+    assert "SMOKE_FAIL" in result.stderr
+    assert "not defined" in result.stderr  # ReferenceError: require is not defined

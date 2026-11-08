@@ -548,19 +548,43 @@ async def test_generate_game_writes_html_on_success(monkeypatch, tmp_path):
     assert remote_api._read_progress("tetris")["status"] == "done"
 
 
-async def test_generate_game_records_error_on_invalid_output(monkeypatch, tmp_path):
+async def test_generate_game_records_error_when_both_tiers_fail(monkeypatch, tmp_path):
     from jarvis import remote_api
     from jarvis.llm import FakeLlm
 
     monkeypatch.setattr(remote_api.settings, "games_dir", tmp_path)
+    # Both the normal attempt AND the escalation fallback must be mocked
+    # — otherwise a failed first attempt would escalate to the real
+    # app.state.game_llm_xlarge (built against real Ollama at import
+    # time) and this "unit" test would make an actual network call.
     remote_api.app.state.game_llm = FakeLlm(["kein code hier, nur text"])
+    remote_api.app.state.game_llm_xlarge = FakeLlm(["kein code hier, nur text"])
     await remote_api._generate_game("tetris")
     assert not (tmp_path / "tetris.html").exists()
     assert remote_api._read_progress("tetris")["status"] == "error"
     # Fixed error code, never the raw model output/exception text — the
     # progress file is readable via /games/{game}/status by anyone
     # holding a (possibly leaked) session token.
-    assert remote_api._read_progress("tetris")["error"] == "no_valid_game_in_response"
+    assert remote_api._read_progress("tetris")["error"] == "generation_failed_smoke_check"
+
+
+async def test_generate_game_escalates_to_xlarge_after_smoke_check_failure(monkeypatch, tmp_path):
+    from jarvis import remote_api
+    from jarvis.llm import FakeLlm
+
+    monkeypatch.setattr(remote_api.settings, "games_dir", tmp_path)
+    # First (large) attempt crashes on load (same bug class as the real
+    # one that shipped): canvas.width isn't evenly divisible by the
+    # block size, so Array(10.667) throws immediately.
+    broken_game = (
+        "<html><body><canvas id='c' width='320' height='640'></canvas>"
+        "<script>const g = Array(320 / 30);</script></body></html>"
+    )
+    remote_api.app.state.game_llm = FakeLlm(["```html\n" + broken_game + "\n```"])
+    remote_api.app.state.game_llm_xlarge = FakeLlm(["```html\n" + _VALID_GAME_HTML + "\n```"])
+    await remote_api._generate_game("tetris")
+    assert (tmp_path / "tetris.html").read_text(encoding="utf-8") == _VALID_GAME_HTML
+    assert remote_api._read_progress("tetris")["status"] == "done"
 
 
 async def test_generate_game_clears_in_flight_flag_when_done(monkeypatch, tmp_path):
@@ -580,6 +604,7 @@ async def test_generate_game_clears_in_flight_flag_on_error(monkeypatch, tmp_pat
 
     monkeypatch.setattr(remote_api.settings, "games_dir", tmp_path)
     remote_api.app.state.game_llm = FakeLlm(["kein code hier, nur text"])
+    remote_api.app.state.game_llm_xlarge = FakeLlm(["kein code hier, nur text"])
     remote_api.app.state.game_in_flight.add("tetris")
     await remote_api._generate_game("tetris")
     assert "tetris" not in remote_api.app.state.game_in_flight
