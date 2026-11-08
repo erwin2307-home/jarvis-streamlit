@@ -72,7 +72,14 @@ GAMES_SYSTEM_PROMPT = (
     "Netz. Nutze ein <canvas> Element und steuere das Spiel per "
     "Tastatur (Pfeiltasten + ggf. Leertaste). Zeige Punktzahl und, falls "
     "zutreffend, Leben/Level sichtbar an. Bei Game Over: Text anzeigen "
-    "und per Taste neu starten können, ohne die Seite neu zu laden."
+    "und per Taste neu starten können, ohne die Seite neu zu laden. "
+    "WICHTIG, da Canvas falsche Zahlen lautlos ignoriert statt einen "
+    "Fehler zu werfen: JEDES bewegte/gezeichnete Objekt braucht beim "
+    "Erzeugen ALLE Zahlenfelder, die später für Position/Bewegung "
+    "benutzt werden (x, y, Geschwindigkeit etc.) — niemals ein Feld "
+    "erst später per += oder *= setzen, das beim Erzeugen fehlte. "
+    "Rasterkonstanten (Zellgröße, Spaltenzahl) exakt und konsistent "
+    "verwenden, nicht mit canvas.width/height verwechseln."
 )
 
 _GAME_PROMPTS: dict[str, str] = {
