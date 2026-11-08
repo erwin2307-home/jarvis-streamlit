@@ -207,12 +207,18 @@ VOICE_WIDGET_HTML = r"""
       cursor: pointer;
     }
     #cooldown-continue { display: none; }
+    #cooldown-manual-btn {
+      border: 1px solid #ffb020; border-radius: 999px; padding: 6px 18px;
+      font-size: 12px; font-weight: 600; color: #ffb020; background: transparent;
+      cursor: pointer;
+    }
   </style>
   <div id="ring-wrap">
     <div id="ring-glow"></div>
     <div id="ring-core"></div>
   </div>
   <button id="talk-btn" type="button">🎤 Gedrückt halten zum Sprechen</button>
+  <button id="cooldown-manual-btn" type="button">❄️ Cool Down</button>
   <div id="timers"></div>
   <div id="status-line">Button oder Leertaste (Ring anklicken) halten zum Sprechen</div>
   <div id="hint-line"></div>
@@ -234,6 +240,7 @@ VOICE_WIDGET_HTML = r"""
     const statusLine = document.getElementById("status-line");
     const transcriptEl = document.getElementById("transcript");
     const talkBtn = document.getElementById("talk-btn");
+    const cooldownManualBtn = document.getElementById("cooldown-manual-btn");
     const playFallback = document.getElementById("play-fallback");
     const timersEl = document.getElementById("timers");
     const hintLine = document.getElementById("hint-line");
@@ -412,6 +419,7 @@ VOICE_WIDGET_HTML = r"""
     choiceTecanBtn.addEventListener("click", () => startInstrumentTimer("Timer Tecan", 2 * 3600 + 43 * 60));
     choiceBioroboterBtn.addEventListener("click", () => startInstrumentTimer("Timer Bioroboter", 2 * 3600 + 55 * 60));
     continueBtn.addEventListener("click", () => handleCooldownContinue());
+    cooldownManualBtn.addEventListener("click", () => startCooldown());
 
     function handleCooldownContinue() {
       if (!cooldown || !cooldown.waitingForContinue) return;
