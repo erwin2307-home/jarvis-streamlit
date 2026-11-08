@@ -201,11 +201,12 @@ VOICE_WIDGET_HTML = r"""
       font-size: 12px; color: #9fe8c0; background: transparent; cursor: pointer;
     }
     #cooldown-choice { display: none; gap: 10px; }
-    #cooldown-choice button {
+    #cooldown-choice button, #cooldown-continue button {
       border: 1px solid #ffb020; border-radius: 999px; padding: 8px 20px;
       font-size: 13px; font-weight: 600; color: #ffb020; background: transparent;
       cursor: pointer;
     }
+    #cooldown-continue { display: none; }
   </style>
   <div id="ring-wrap">
     <div id="ring-glow"></div>
@@ -218,6 +219,9 @@ VOICE_WIDGET_HTML = r"""
   <div id="cooldown-choice">
     <button id="choice-tecan" type="button">Timer Tecan (2:43:00)</button>
     <button id="choice-bioroboter" type="button">Timer Bioroboter (2:55:00)</button>
+  </div>
+  <div id="cooldown-continue">
+    <button id="continue-btn" type="button">Weiter ▶</button>
   </div>
   <button id="play-fallback" type="button" style="display:none;">▶️ Antwort abspielen</button>
   <div id="transcript"></div>
@@ -236,6 +240,8 @@ VOICE_WIDGET_HTML = r"""
     const choiceEl = document.getElementById("cooldown-choice");
     const choiceTecanBtn = document.getElementById("choice-tecan");
     const choiceBioroboterBtn = document.getElementById("choice-bioroboter");
+    const continueEl = document.getElementById("cooldown-continue");
+    const continueBtn = document.getElementById("continue-btn");
 
     // Real animal recordings (verified Wikimedia Commons .ogg files) mixed
     // with speech-synthesized meme alarm lines — using the browser's own
@@ -364,23 +370,27 @@ VOICE_WIDGET_HTML = r"""
       addTimer(30 * 60, "Cool Down", () => {
         speakRepeated("Beadchips jetzt rausnehmen", "de-DE", 3, () => {
           cooldown.waitingForContinue = "wash1";
-          cooldownHint("Sage 'weiter' für Chip Wash 1");
+          cooldownHint("Sage 'weiter' oder klicke Weiter für Chip Wash 1");
+          continueEl.style.display = "flex";
         });
       });
     }
 
     function startChipWash1() {
       cooldownHint("");
+      continueEl.style.display = "none";
       addTimer(60, "Chip Wash 1", startChipBath1);
     }
     function startChipBath1() {
       addTimer(60, "Chip Bath 1", () => {
         cooldown.waitingForContinue = "wash2";
-        cooldownHint("Sage 'weiter' für Chip Wash 2");
+        cooldownHint("Sage 'weiter' oder klicke Weiter für Chip Wash 2");
+        continueEl.style.display = "flex";
       });
     }
     function startChipWash2() {
       cooldownHint("");
+      continueEl.style.display = "none";
       addTimer(60, "Chip Wash 2", startChipBath2);
     }
     function startChipBath2() {
@@ -401,6 +411,7 @@ VOICE_WIDGET_HTML = r"""
     }
     choiceTecanBtn.addEventListener("click", () => startInstrumentTimer("Timer Tecan", 2 * 3600 + 43 * 60));
     choiceBioroboterBtn.addEventListener("click", () => startInstrumentTimer("Timer Bioroboter", 2 * 3600 + 55 * 60));
+    continueBtn.addEventListener("click", () => handleCooldownContinue());
 
     function handleCooldownContinue() {
       if (!cooldown || !cooldown.waitingForContinue) return;
