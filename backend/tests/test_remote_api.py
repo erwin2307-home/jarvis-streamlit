@@ -557,6 +557,45 @@ async def test_generate_game_records_error_on_invalid_output(monkeypatch, tmp_pa
     await remote_api._generate_game("tetris")
     assert not (tmp_path / "tetris.html").exists()
     assert remote_api._read_progress("tetris")["status"] == "error"
+    # Fixed error code, never the raw model output/exception text — the
+    # progress file is readable via /games/{game}/status by anyone
+    # holding a (possibly leaked) session token.
+    assert remote_api._read_progress("tetris")["error"] == "no_valid_game_in_response"
+
+
+async def test_generate_game_clears_in_flight_flag_when_done(monkeypatch, tmp_path):
+    from jarvis import remote_api
+    from jarvis.llm import FakeLlm
+
+    monkeypatch.setattr(remote_api.settings, "games_dir", tmp_path)
+    remote_api.app.state.game_llm = FakeLlm(["```html\n" + _VALID_GAME_HTML + "\n```"])
+    remote_api.app.state.game_in_flight.add("tetris")
+    await remote_api._generate_game("tetris")
+    assert "tetris" not in remote_api.app.state.game_in_flight
+
+
+async def test_generate_game_clears_in_flight_flag_on_error(monkeypatch, tmp_path):
+    from jarvis import remote_api
+    from jarvis.llm import FakeLlm
+
+    monkeypatch.setattr(remote_api.settings, "games_dir", tmp_path)
+    remote_api.app.state.game_llm = FakeLlm(["kein code hier, nur text"])
+    remote_api.app.state.game_in_flight.add("tetris")
+    await remote_api._generate_game("tetris")
+    assert "tetris" not in remote_api.app.state.game_in_flight
+
+
+def test_generate_game_short_circuits_when_already_in_flight(client, monkeypatch, tmp_path):
+    from jarvis import remote_api
+
+    monkeypatch.setattr(remote_api.settings, "games_dir", tmp_path)
+    remote_api.app.state.game_in_flight.add("tetris")
+    try:
+        resp = client.post("/games/tetris/generate", headers={"X-API-Key": "test-secret"})
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "generating"
+    finally:
+        remote_api.app.state.game_in_flight.discard("tetris")
 
 
 def test_game_status_requires_api_key(client):
@@ -584,43 +623,85 @@ def test_game_status_is_done_when_html_already_exists(client, monkeypatch, tmp_p
     assert resp.json()["status"] == "done"
 
 
-def test_serve_game_requires_key(client, monkeypatch, tmp_path):
+def test_mint_game_ticket_requires_api_key(client, monkeypatch, tmp_path):
     from jarvis import remote_api
 
     monkeypatch.setattr(remote_api.settings, "games_dir", tmp_path)
     tmp_path.mkdir(exist_ok=True)
     (tmp_path / "aliens.html").write_text(_VALID_GAME_HTML, encoding="utf-8")
-    resp = client.get("/games/aliens")
+    resp = client.post("/games/aliens/ticket")
     assert resp.status_code == 401
 
 
-def test_serve_game_404_when_not_generated_yet(client, monkeypatch, tmp_path):
+def test_mint_game_ticket_404_when_not_generated_yet(client, monkeypatch, tmp_path):
     from jarvis import remote_api
 
     monkeypatch.setattr(remote_api.settings, "games_dir", tmp_path)
-    resp = client.get("/games/aliens", params={"key": "test-secret"})
+    resp = client.post("/games/aliens/ticket", headers={"X-API-Key": "test-secret"})
     assert resp.status_code == 404
 
 
-def test_serve_game_returns_generated_html(client, monkeypatch, tmp_path):
+def test_mint_game_ticket_returns_a_ticket_once_ready(client, monkeypatch, tmp_path):
     from jarvis import remote_api
 
     monkeypatch.setattr(remote_api.settings, "games_dir", tmp_path)
     tmp_path.mkdir(exist_ok=True)
     (tmp_path / "aliens.html").write_text(_VALID_GAME_HTML, encoding="utf-8")
-    resp = client.get("/games/aliens", params={"key": "test-secret"})
+    resp = client.post("/games/aliens/ticket", headers={"X-API-Key": "test-secret"})
+    assert resp.status_code == 200
+    assert len(resp.json()["ticket"]) > 20
+
+
+def test_serve_game_requires_a_ticket(client, monkeypatch, tmp_path):
+    from jarvis import remote_api
+
+    monkeypatch.setattr(remote_api.settings, "games_dir", tmp_path)
+    tmp_path.mkdir(exist_ok=True)
+    (tmp_path / "aliens.html").write_text(_VALID_GAME_HTML, encoding="utf-8")
+    assert client.get("/games/aliens").status_code == 401
+    assert client.get("/games/aliens", params={"ticket": "garbage"}).status_code == 401
+
+
+def test_serve_game_returns_html_with_valid_ticket(client, monkeypatch, tmp_path):
+    from jarvis import remote_api
+
+    monkeypatch.setattr(remote_api.settings, "games_dir", tmp_path)
+    tmp_path.mkdir(exist_ok=True)
+    (tmp_path / "aliens.html").write_text(_VALID_GAME_HTML, encoding="utf-8")
+    ticket = client.post(
+        "/games/aliens/ticket", headers={"X-API-Key": "test-secret"}
+    ).json()["ticket"]
+    resp = client.get("/games/aliens", params={"ticket": ticket})
     assert resp.status_code == 200
     assert resp.text == _VALID_GAME_HTML
+    assert resp.headers["content-security-policy"] == "sandbox allow-scripts"
+    assert resp.headers["referrer-policy"] == "no-referrer"
 
 
-def test_serve_game_accepts_session_token_too(client, monkeypatch, tmp_path):
+def test_serve_game_ticket_is_single_use(client, monkeypatch, tmp_path):
     from jarvis import remote_api
 
     monkeypatch.setattr(remote_api.settings, "games_dir", tmp_path)
     tmp_path.mkdir(exist_ok=True)
     (tmp_path / "aliens.html").write_text(_VALID_GAME_HTML, encoding="utf-8")
-    token = client.post(
-        "/session-token", headers={"X-API-Key": "test-secret"}
-    ).json()["token"]
-    resp = client.get("/games/aliens", params={"key": token})
-    assert resp.status_code == 200
+    ticket = client.post(
+        "/games/aliens/ticket", headers={"X-API-Key": "test-secret"}
+    ).json()["ticket"]
+    first = client.get("/games/aliens", params={"ticket": ticket})
+    second = client.get("/games/aliens", params={"ticket": ticket})
+    assert first.status_code == 200
+    assert second.status_code == 401
+
+
+def test_serve_game_ticket_is_scoped_to_its_own_game(client, monkeypatch, tmp_path):
+    from jarvis import remote_api
+
+    monkeypatch.setattr(remote_api.settings, "games_dir", tmp_path)
+    tmp_path.mkdir(exist_ok=True)
+    (tmp_path / "aliens.html").write_text(_VALID_GAME_HTML, encoding="utf-8")
+    (tmp_path / "pacman.html").write_text(_VALID_GAME_HTML, encoding="utf-8")
+    ticket = client.post(
+        "/games/aliens/ticket", headers={"X-API-Key": "test-secret"}
+    ).json()["ticket"]
+    resp = client.get("/games/pacman", params={"ticket": ticket})
+    assert resp.status_code == 401

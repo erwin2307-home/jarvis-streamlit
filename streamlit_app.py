@@ -500,8 +500,23 @@ VOICE_WIDGET_HTML = r"""
           return;
         }
         if (status.status === "done") {
+          // Single-use, 5-minute ticket instead of the real key/session
+          // token — this URL is a top-level navigation (browser
+          // history, Referer headers, proxy logs), not a header, so it
+          // shouldn't carry a long-lived or broadly-valid credential.
+          let ticket;
+          try {
+            const ticketResp = await fetch(
+              API_URL.replace(/\/$/, "") + "/games/" + gameId + "/ticket",
+              { method: "POST", headers: { "X-API-Key": API_KEY } }
+            );
+            ticket = (await ticketResp.json()).ticket;
+          } catch (e) {
+            cooldownHint(label + ": Fehler beim Öffnen — " + e);
+            return;
+          }
           cooldownHint("");
-          const gameUrl = API_URL.replace(/\/$/, "") + "/games/" + gameId + "?key=" + encodeURIComponent(API_KEY);
+          const gameUrl = API_URL.replace(/\/$/, "") + "/games/" + gameId + "?ticket=" + encodeURIComponent(ticket);
           if (gameWin && !gameWin.closed) gameWin.location.href = gameUrl;
           else window.open(gameUrl, "_blank"); // tab was blocked/closed — try again, may still be blocked
           return;

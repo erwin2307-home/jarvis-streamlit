@@ -167,6 +167,30 @@ SESSION_TOKEN_TTL = timedelta(hours=12)
 _session_tokens: dict[str, datetime] = {}
 app.state.session_tokens = _session_tokens
 
+# Single-use, short-TTL tickets for serve_game() below — a game page is
+# loaded via a top-level browser navigation (window.open), which can't
+# attach an X-API-Key header, so it needs *some* credential in the URL.
+# The real master key or even the 12h session token would sit in browser
+# history/referrers/proxy logs for far longer than needed; minted only
+# from an already-authenticated request, scoped to one game, consumed on
+# first use. In-memory only, same as session_tokens.
+GAME_TICKET_TTL = timedelta(minutes=5)
+_game_tickets: dict[str, tuple[str, datetime]] = {}
+app.state.game_tickets = _game_tickets
+
+# In-process, in-memory dispatch guard for generate_game() below — NOT
+# the on-disk progress file. A file-based "is it already generating?"
+# check is TOCTOU-racy (two near-simultaneous requests can both read
+# "not generating" before either writes "generating") and, worse, a
+# crashed background task would leave the file stuck on "generating"
+# forever with nothing to ever clear it. A plain set with no `await`
+# between the membership check and the insert is already atomic under
+# asyncio's cooperative scheduling (no other coroutine can run in that
+# gap), and it's cleared in generate's `finally`, so a crash just drops
+# it — same reasoning as coding.py's coding_state dict needing no lock.
+_game_in_flight: set[str] = set()
+app.state.game_in_flight = _game_in_flight
+
 
 def _decode_wav_to_pcm16(raw: bytes, target_sr: int) -> npt.NDArray[np.int16]:
     """Decode uploaded WAV bytes to mono int16 PCM at target_sr (Whisper's
@@ -538,15 +562,28 @@ async def _generate_game(game: str) -> None:
         html = extract_html_game(full)
         if html is None:
             logger.warning(f"games: model produced no valid game for {game!r}")
-            write_progress(progress_path, status="error", error="Kein gültiges Spiel erkannt.")
+            write_progress(progress_path, status="error", error="no_valid_game_in_response")
             return
         settings.games_dir.mkdir(parents=True, exist_ok=True)
-        _game_html_path(game).write_text(html, encoding="utf-8")
+        # Temp-file-then-replace, same reasoning as write_progress's own
+        # atomic write — serve_game() should never be able to read a
+        # half-written file.
+        final_path = _game_html_path(game)
+        tmp_path = final_path.with_suffix(".html.tmp")
+        tmp_path.write_text(html, encoding="utf-8")
+        tmp_path.replace(final_path)
         write_progress(progress_path, status="done")
         logger.info(f"games: generated {game}")
     except Exception as exc:
+        # Full detail stays server-side in the log only — the progress
+        # file is readable by anyone holding a (possibly leaked) session
+        # token via /games/{game}/status, so it gets a fixed, generic
+        # code instead of str(exc), which could otherwise reflect
+        # internal paths/config/stack details back to that caller.
         logger.warning(f"games: generation failed for {game!r} (ignored): {exc!r}")
-        write_progress(progress_path, status="error", error=str(exc))
+        write_progress(progress_path, status="error", error="generation_failed")
+    finally:
+        app.state.game_in_flight.discard(game)
 
 
 @app.post("/games/{game}/generate")
@@ -554,8 +591,9 @@ async def generate_game(game: str, x_api_key: str | None = Header(default=None))
     _check_key(x_api_key)
     if game not in GAME_IDS:
         raise HTTPException(status_code=404, detail=f"unknown game {game!r}")
-    if _read_progress(game).get("status") == "generating":
+    if game in app.state.game_in_flight:
         return {"status": "generating"}  # already in flight — don't double-dispatch
+    app.state.game_in_flight.add(game)  # no `await` since the check above — atomic
     asyncio.create_task(_generate_game(game))
     return {"status": "generating"}
 
@@ -573,16 +611,45 @@ async def game_status(game: str, x_api_key: str | None = Header(default=None)) -
     return {"status": "idle"}
 
 
-@app.get("/games/{game}", response_class=HTMLResponse)
-async def serve_game(game: str, key: str | None = None) -> str:
+@app.post("/games/{game}/ticket")
+async def mint_game_ticket(
+    game: str, x_api_key: str | None = Header(default=None)
+) -> dict[str, str]:
+    """Authenticated (X-API-Key header) — mints the single-use ticket
+    serve_game() below accepts instead of the real key/session token."""
+    _check_key(x_api_key)
+    if game not in GAME_IDS:
+        raise HTTPException(status_code=404, detail=f"unknown game {game!r}")
+    if not _game_html_path(game).exists():
+        raise HTTPException(status_code=404, detail="game not generated yet")
+    ticket = secrets.token_urlsafe(32)
+    app.state.game_tickets[ticket] = (game, datetime.now(timezone.utc) + GAME_TICKET_TTL)
+    return {"ticket": ticket}
+
+
+@app.get("/games/{game}")
+async def serve_game(game: str, ticket: str | None = None) -> HTMLResponse:
     # Served via a top-level browser navigation (window.open), which
-    # can't attach an X-API-Key header — accepts the key as a query
-    # param instead, same _check_key as everywhere else (real master key
-    # OR a short-lived session token, never a new/weaker credential).
-    _check_key(key)
+    # can't attach an X-API-Key header — a scoped single-use ticket
+    # (minted above) instead of the real key/session token, so nothing
+    # long-lived or broadly-valid ends up sitting in browser history,
+    # Referer headers, or proxy logs.
+    entry = app.state.game_tickets.pop(ticket or "", None)
+    if entry is None or entry[0] != game or entry[1] <= datetime.now(timezone.utc):
+        raise HTTPException(status_code=401, detail="invalid or expired ticket")
     if game not in GAME_IDS:
         raise HTTPException(status_code=404, detail=f"unknown game {game!r}")
     path = _game_html_path(game)
     if not path.exists():
         raise HTTPException(status_code=404, detail="game not generated yet")
-    return path.read_text(encoding="utf-8")
+    # Model-generated content serving itself as HTML — the extra
+    # lockdown costs nothing since a canvas game needs no network/frame
+    # access anyway, and caps the blast radius of anything the model
+    # slipped in (sandbox still allows the script the game itself needs).
+    return HTMLResponse(
+        content=path.read_text(encoding="utf-8"),
+        headers={
+            "Content-Security-Policy": "sandbox allow-scripts",
+            "Referrer-Policy": "no-referrer",
+        },
+    )
