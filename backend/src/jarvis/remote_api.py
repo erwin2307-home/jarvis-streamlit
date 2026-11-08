@@ -15,23 +15,29 @@ Run: uv run uvicorn jarvis.remote_api:app --host 0.0.0.0 --port 8800
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
+import json
 import re
 import secrets
 from datetime import datetime, timedelta, timezone
 from fractions import Fraction
+from pathlib import Path
 
 import numpy as np
 import numpy.typing as npt
 import soundfile as sf  # type: ignore[import-untyped]
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from loguru import logger
 from pydantic import BaseModel
 
 from jarvis import __version__
+from jarvis.coding import progress_path_for, write_progress
 from jarvis.config import get_settings
+from jarvis.games import GAME_IDS, GAMES_SYSTEM_PROMPT, extract_html_game, game_prompt
 from jarvis.llm import (
     HybridLlm,
     Llm,
@@ -133,6 +139,18 @@ def _build_tts() -> Tts:
 app.state.llm = _build_llm()
 app.state.stt = _build_stt()
 app.state.tts = _build_tts()
+# Dedicated model load for games.py's game-generation endpoints below —
+# always the "large" coding tier (settings.coding_model), independent of
+# app.state.llm's own routing. A full game is a much bigger ask than a
+# normal chat/voice answer, hence game_max_tokens instead of
+# llm_max_tokens.
+app.state.game_llm = RealLlm(
+    host=settings.llm_host,
+    model=settings.coding_model,
+    system_prompt=GAMES_SYSTEM_PROMPT,
+    timeout_s=settings.llm_timeout_s,
+    max_tokens=settings.game_max_tokens,
+)
 
 # Short-lived tokens so the browser never has to carry the real master
 # key. The Streamlit frontend's voice widget runs entirely client-side
@@ -468,3 +486,103 @@ async def voice(
         timer_seconds=timer_seconds,
         timer_name=timer_name,
     )
+
+
+# --- Browser-playable games (games.py) -------------------------------
+# See games.py's module docstring for why this is a different, safe-to-
+# expose-remotely trust model than the Python coding fast-path (which
+# app.py deliberately keeps out of this remote API entirely).
+
+
+def _game_html_path(game: str) -> Path:
+    return settings.games_dir / f"{game}.html"
+
+
+def _game_progress_path(game: str) -> Path:
+    return progress_path_for(game, settings.games_dir)
+
+
+def _read_progress(game: str) -> dict[str, object]:
+    path = _game_progress_path(game)
+    try:
+        data: dict[str, object] = json.loads(path.read_text(encoding="utf-8"))
+        return data
+    except (OSError, ValueError):
+        return {}
+
+
+async def _generate_game(game: str) -> None:
+    progress_path = _game_progress_path(game)
+    write_progress(
+        progress_path,
+        status="generating",
+        tokens=0,
+        max_tokens=settings.game_max_tokens,
+        model=settings.coding_model,
+    )
+    try:
+        game_llm: Llm = app.state.game_llm
+        full = ""
+        async for ev in game_llm.chat([{"role": "user", "content": game_prompt(game)}]):
+            if ev.kind == "chunk":
+                full += ev.text
+                write_progress(
+                    progress_path,
+                    status="generating",
+                    tokens=len(full) // 4,
+                    max_tokens=settings.game_max_tokens,
+                    model=settings.coding_model,
+                )
+            elif ev.kind == "done":
+                full = ev.text or full
+        html = extract_html_game(full)
+        if html is None:
+            logger.warning(f"games: model produced no valid game for {game!r}")
+            write_progress(progress_path, status="error", error="Kein gültiges Spiel erkannt.")
+            return
+        settings.games_dir.mkdir(parents=True, exist_ok=True)
+        _game_html_path(game).write_text(html, encoding="utf-8")
+        write_progress(progress_path, status="done")
+        logger.info(f"games: generated {game}")
+    except Exception as exc:
+        logger.warning(f"games: generation failed for {game!r} (ignored): {exc!r}")
+        write_progress(progress_path, status="error", error=str(exc))
+
+
+@app.post("/games/{game}/generate")
+async def generate_game(game: str, x_api_key: str | None = Header(default=None)) -> dict[str, str]:
+    _check_key(x_api_key)
+    if game not in GAME_IDS:
+        raise HTTPException(status_code=404, detail=f"unknown game {game!r}")
+    if _read_progress(game).get("status") == "generating":
+        return {"status": "generating"}  # already in flight — don't double-dispatch
+    asyncio.create_task(_generate_game(game))
+    return {"status": "generating"}
+
+
+@app.get("/games/{game}/status")
+async def game_status(game: str, x_api_key: str | None = Header(default=None)) -> dict[str, object]:
+    _check_key(x_api_key)
+    if game not in GAME_IDS:
+        raise HTTPException(status_code=404, detail=f"unknown game {game!r}")
+    progress = _read_progress(game)
+    if progress.get("status") == "done" or (not progress and _game_html_path(game).exists()):
+        return {"status": "done"}
+    if progress:
+        return progress
+    return {"status": "idle"}
+
+
+@app.get("/games/{game}", response_class=HTMLResponse)
+async def serve_game(game: str, key: str | None = None) -> str:
+    # Served via a top-level browser navigation (window.open), which
+    # can't attach an X-API-Key header — accepts the key as a query
+    # param instead, same _check_key as everywhere else (real master key
+    # OR a short-lived session token, never a new/weaker credential).
+    _check_key(key)
+    if game not in GAME_IDS:
+        raise HTTPException(status_code=404, detail=f"unknown game {game!r}")
+    path = _game_html_path(game)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="game not generated yet")
+    return path.read_text(encoding="utf-8")

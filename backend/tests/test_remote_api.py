@@ -505,3 +505,122 @@ def test_chat_continue_query_bypasses_llm(client):
     )
     assert resp.status_code == 200
     assert "TRAP" not in resp.json()["reply"]
+
+
+# --- Browser games (games.py) -----------------------------------------
+
+_VALID_GAME_HTML = (
+    "<html><body><canvas id='c'></canvas>"
+    "<script>function tick(){requestAnimationFrame(tick);}tick();</script>"
+    "</body></html>"
+)
+
+
+def test_generate_game_requires_api_key(client):
+    resp = client.post("/games/tetris/generate")
+    assert resp.status_code == 401
+
+
+def test_generate_game_rejects_unknown_game(client):
+    resp = client.post("/games/not-a-game/generate", headers={"X-API-Key": "test-secret"})
+    assert resp.status_code == 404
+
+
+def test_generate_game_returns_generating_immediately(client, monkeypatch, tmp_path):
+    from jarvis import remote_api
+    from jarvis.llm import FakeLlm
+
+    monkeypatch.setattr(remote_api.settings, "games_dir", tmp_path)
+    client.app.state.game_llm = FakeLlm(["```html\n" + _VALID_GAME_HTML + "\n```"])
+    resp = client.post("/games/tetris/generate", headers={"X-API-Key": "test-secret"})
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "generating"
+
+
+async def test_generate_game_writes_html_on_success(monkeypatch, tmp_path):
+    from jarvis import remote_api
+    from jarvis.llm import FakeLlm
+
+    monkeypatch.setattr(remote_api.settings, "games_dir", tmp_path)
+    remote_api.app.state.game_llm = FakeLlm(["```html\n" + _VALID_GAME_HTML + "\n```"])
+    await remote_api._generate_game("tetris")
+    assert (tmp_path / "tetris.html").read_text(encoding="utf-8") == _VALID_GAME_HTML
+    assert remote_api._read_progress("tetris")["status"] == "done"
+
+
+async def test_generate_game_records_error_on_invalid_output(monkeypatch, tmp_path):
+    from jarvis import remote_api
+    from jarvis.llm import FakeLlm
+
+    monkeypatch.setattr(remote_api.settings, "games_dir", tmp_path)
+    remote_api.app.state.game_llm = FakeLlm(["kein code hier, nur text"])
+    await remote_api._generate_game("tetris")
+    assert not (tmp_path / "tetris.html").exists()
+    assert remote_api._read_progress("tetris")["status"] == "error"
+
+
+def test_game_status_requires_api_key(client):
+    resp = client.get("/games/tetris/status")
+    assert resp.status_code == 401
+
+
+def test_game_status_is_idle_when_never_generated(client, monkeypatch, tmp_path):
+    from jarvis import remote_api
+
+    monkeypatch.setattr(remote_api.settings, "games_dir", tmp_path)
+    resp = client.get("/games/tetris/status", headers={"X-API-Key": "test-secret"})
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "idle"
+
+
+def test_game_status_is_done_when_html_already_exists(client, monkeypatch, tmp_path):
+    from jarvis import remote_api
+
+    monkeypatch.setattr(remote_api.settings, "games_dir", tmp_path)
+    tmp_path.mkdir(exist_ok=True)
+    (tmp_path / "pacman.html").write_text(_VALID_GAME_HTML, encoding="utf-8")
+    resp = client.get("/games/pacman/status", headers={"X-API-Key": "test-secret"})
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "done"
+
+
+def test_serve_game_requires_key(client, monkeypatch, tmp_path):
+    from jarvis import remote_api
+
+    monkeypatch.setattr(remote_api.settings, "games_dir", tmp_path)
+    tmp_path.mkdir(exist_ok=True)
+    (tmp_path / "aliens.html").write_text(_VALID_GAME_HTML, encoding="utf-8")
+    resp = client.get("/games/aliens")
+    assert resp.status_code == 401
+
+
+def test_serve_game_404_when_not_generated_yet(client, monkeypatch, tmp_path):
+    from jarvis import remote_api
+
+    monkeypatch.setattr(remote_api.settings, "games_dir", tmp_path)
+    resp = client.get("/games/aliens", params={"key": "test-secret"})
+    assert resp.status_code == 404
+
+
+def test_serve_game_returns_generated_html(client, monkeypatch, tmp_path):
+    from jarvis import remote_api
+
+    monkeypatch.setattr(remote_api.settings, "games_dir", tmp_path)
+    tmp_path.mkdir(exist_ok=True)
+    (tmp_path / "aliens.html").write_text(_VALID_GAME_HTML, encoding="utf-8")
+    resp = client.get("/games/aliens", params={"key": "test-secret"})
+    assert resp.status_code == 200
+    assert resp.text == _VALID_GAME_HTML
+
+
+def test_serve_game_accepts_session_token_too(client, monkeypatch, tmp_path):
+    from jarvis import remote_api
+
+    monkeypatch.setattr(remote_api.settings, "games_dir", tmp_path)
+    tmp_path.mkdir(exist_ok=True)
+    (tmp_path / "aliens.html").write_text(_VALID_GAME_HTML, encoding="utf-8")
+    token = client.post(
+        "/session-token", headers={"X-API-Key": "test-secret"}
+    ).json()["token"]
+    resp = client.get("/games/aliens", params={"key": token})
+    assert resp.status_code == 200

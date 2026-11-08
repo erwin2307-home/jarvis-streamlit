@@ -219,6 +219,22 @@ class Settings(BaseModel):
         )
     )
 
+    # Browser-playable games (games.py), generated on request by the
+    # "large" coding-model tier and served as static HTML by remote_api.py
+    # — see games.py's module docstring for why this is safe to expose
+    # remotely even though the Python coding fast-path above isn't. A full
+    # game is a much longer generation than a coding-fastpath script, so
+    # it gets its own, far higher token cap rather than sharing
+    # coding_max_tokens.
+    game_max_tokens: int = Field(
+        default_factory=lambda: int(os.getenv("JARVIS_GAME_MAX_TOKENS", "8000"))
+    )
+    games_dir: Path = Field(
+        default_factory=lambda: Path(
+            os.getenv("JARVIS_GAMES_DIR", str(Path.home() / "Desktop" / "Jarvis_Games"))
+        )
+    )
+
     # Remote text-chat API (remote_api.py) — a separate, minimal FastAPI
     # app meant to be tunneled to the public internet so a Streamlit
     # Cloud frontend can reach this machine's LLM. Deliberately exposes

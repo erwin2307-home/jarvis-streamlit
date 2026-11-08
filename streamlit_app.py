@@ -239,6 +239,7 @@ VOICE_WIDGET_HTML = r"""
   <div id="games-choice">
     <button id="game-tetris" type="button">Tetris</button>
     <button id="game-pacman" type="button">Pac-Man</button>
+    <button id="game-aliens" type="button">Aliens</button>
   </div>
   <div id="timers"></div>
   <div id="status-line">Button oder Leertaste (Ring anklicken) halten zum Sprechen</div>
@@ -266,6 +267,7 @@ VOICE_WIDGET_HTML = r"""
     const gamesChoiceEl = document.getElementById("games-choice");
     const gameTetrisBtn = document.getElementById("game-tetris");
     const gamePacmanBtn = document.getElementById("game-pacman");
+    const gameAliensBtn = document.getElementById("game-aliens");
     const playFallback = document.getElementById("play-fallback");
     const timersEl = document.getElementById("timers");
     const hintLine = document.getElementById("hint-line");
@@ -448,14 +450,79 @@ VOICE_WIDGET_HTML = r"""
     gamesBtn.addEventListener("click", () => {
       gamesChoiceEl.style.display = gamesChoiceEl.style.display === "flex" ? "none" : "flex";
     });
-    // Tetris/Pac-Man generation backend not built yet — placeholder so
-    // the button isn't a silent dead click while that's decided.
-    gameTetrisBtn.addEventListener("click", () => {
-      cooldownHint("Tetris kommt noch — Generierung ist noch nicht angebunden.");
-    });
-    gamePacmanBtn.addEventListener("click", () => {
-      cooldownHint("Pac-Man kommt noch — Generierung ist noch nicht angebunden.");
-    });
+
+    // Tetris/Pac-Man/Aliens: generated on request by the "large" coding
+    // model (see games.py/remote_api.py) and served as a static page —
+    // this just triggers generation, polls status, then opens the
+    // result in a new tab once it's ready. API_KEY here is already the
+    // short-lived session token (see render_voice_widget), safe to put
+    // in a query string for the new-tab navigation (window.open can't
+    // attach a custom header).
+    const GAME_POLL_MS = 3000;
+    const GAME_POLL_MAX_TRIES = 200; // ~10 min cap — a 14b-model full
+                                      // game generation can genuinely
+                                      // take minutes on CPU.
+
+    async function playGame(gameId, label) {
+      // Opened synchronously, inside the click handler itself — a
+      // window.open() called later (after the awaits below) loses the
+      // user-gesture context and most browsers silently block it as a
+      // popup. Navigating this already-open tab's location afterwards
+      // is not subject to that block.
+      const gameWin = window.open("", "_blank");
+      if (gameWin) {
+        gameWin.document.write(
+          "<body style='background:#05070c;color:#9fe8c0;font-family:sans-serif;" +
+          "display:flex;align-items:center;justify-content:center;height:100vh;'>" +
+          "<p>" + label + " wird programmiert …</p></body>"
+        );
+      }
+
+      try {
+        await fetch(API_URL.replace(/\/$/, "") + "/games/" + gameId + "/generate", {
+          method: "POST",
+          headers: { "X-API-Key": API_KEY },
+        });
+      } catch (e) {
+        cooldownHint(label + ": Fehler beim Starten — " + e);
+        return;
+      }
+      for (let i = 0; i < GAME_POLL_MAX_TRIES; i++) {
+        let status;
+        try {
+          const resp = await fetch(
+            API_URL.replace(/\/$/, "") + "/games/" + gameId + "/status",
+            { headers: { "X-API-Key": API_KEY } }
+          );
+          status = await resp.json();
+        } catch (e) {
+          cooldownHint(label + ": Fehler beim Abfragen — " + e);
+          return;
+        }
+        if (status.status === "done") {
+          cooldownHint("");
+          const gameUrl = API_URL.replace(/\/$/, "") + "/games/" + gameId + "?key=" + encodeURIComponent(API_KEY);
+          if (gameWin && !gameWin.closed) gameWin.location.href = gameUrl;
+          else window.open(gameUrl, "_blank"); // tab was blocked/closed — try again, may still be blocked
+          return;
+        }
+        if (status.status === "error") {
+          cooldownHint(label + ": Generierung fehlgeschlagen — " + (status.error || "unbekannt"));
+          if (gameWin && !gameWin.closed) gameWin.close();
+          return;
+        }
+        const tokens = status.tokens || 0;
+        const maxTokens = status.max_tokens || 1;
+        const pct = Math.min(Math.round((tokens / maxTokens) * 100), 98);
+        cooldownHint(label + " wird programmiert … " + pct + "%");
+        await new Promise((r) => setTimeout(r, GAME_POLL_MS));
+      }
+      cooldownHint(label + ": dauert ungewöhnlich lange, bitte später erneut versuchen.");
+    }
+
+    gameTetrisBtn.addEventListener("click", () => playGame("tetris", "Tetris"));
+    gamePacmanBtn.addEventListener("click", () => playGame("pacman", "Pac-Man"));
+    gameAliensBtn.addEventListener("click", () => playGame("aliens", "Aliens"));
 
     function handleCooldownContinue() {
       if (!cooldown || !cooldown.waitingForContinue) return;
@@ -684,10 +751,11 @@ def render_voice_widget(api_url: str, voice_token: str) -> None:
     html = VOICE_WIDGET_HTML.replace("__API_URL__", api_url.replace('"', "")).replace(
         "__API_KEY__", voice_token.replace('"', "")
     )
-    # 500, not 380 — Cool Down + Spiele buttons added below talk-btn
-    # pushed the flex column taller; components.html doesn't auto-size
-    # or scroll, so anything past the fixed height gets silently clipped.
-    components.html(html, height=500)
+    # 520, not 380 — Cool Down + Spiele buttons (plus the Tetris/Pac-Man/
+    # Aliens reveal row) added below talk-btn pushed the flex column
+    # taller; components.html doesn't auto-size or scroll, so anything
+    # past the fixed height gets silently clipped.
+    components.html(html, height=520)
 
 
 # API_KEY and API_URL come ONLY from st.secrets — never from a widget.
