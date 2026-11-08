@@ -7,9 +7,19 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
+from jarvis.coding import TIER_ORDER
+
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 MODELS_DIR = REPO_ROOT / "models"
+
+
+def _clamped_tier(value: str) -> str:
+    """Falls back to "small" for an unrecognized tier name — a stale or
+    typo'd JARVIS_CODING_DEFAULT_TIER would otherwise KeyError on every
+    coding request (coding_models dict in app.py is keyed only by
+    TIER_ORDER's names), unlike coding.next_tier() which already clamps."""
+    return value if value in TIER_ORDER else "small"
 
 
 class Settings(BaseModel):
@@ -162,18 +172,34 @@ class Settings(BaseModel):
         default_factory=lambda: int(os.getenv("JARVIS_TTS_SAMPLE_RATE", "24000"))
     )
 
-    # Dedicated coding model (separate from llm_model) for the background
+    # Three coding-model tiers (separate from llm_model) for the background
     # code-generation feature — see coding.py + orchestrator's
-    # coding_handler. Runs as its own Ollama model load, independent of
-    # the voice-response model. 1.5b was unreliable (5 distinct bug types
-    # across 5 attempts at a calculator); 3b improved a lot (real logic,
-    # clean structure) but still had one widget-API bug
-    # (OptionMenu.get()). 32b (~19GB) was tried but killed twice by the
+    # coding_handler. Each runs as its own Ollama model load, independent
+    # of the voice-response model. Default tier is "small" (fast, loads
+    # quickly); a voice/text trigger ("größeres Modell", "code war
+    # schlecht", see coding.is_coding_upgrade_request) re-runs the same
+    # last coding request one tier up. 1.5b alone was unreliable (5
+    # distinct bug types across 5 attempts at a calculator) — it's kept
+    # as the "small" tier anyway since most requests are simple enough
+    # for it and it's by far the fastest; 3b improved a lot (real logic,
+    # clean structure) but still had one widget-API bug (OptionMenu.get())
+    # — used as "medium". 32b (~19GB) was tried but killed twice by the
     # OS for memory pressure on this 32GB-RAM machine (<2GB free with it
-    # loaded) — not viable here. Settled on 14b (~9GB) as the largest
+    # loaded) — not viable, so "large" stays at 14b (~9GB), the biggest
     # size that actually fits alongside everything else running.
+    coding_model_small: str = Field(
+        default_factory=lambda: os.getenv("JARVIS_CODING_MODEL_SMALL", "qwen2.5-coder:1.5b")
+    )
+    coding_model_medium: str = Field(
+        default_factory=lambda: os.getenv("JARVIS_CODING_MODEL_MEDIUM", "qwen2.5-coder:7b")
+    )
+    # Historically the only tier (env var kept as JARVIS_CODING_MODEL,
+    # unchanged, for backward compatibility) — now the "large" tier.
     coding_model: str = Field(
         default_factory=lambda: os.getenv("JARVIS_CODING_MODEL", "qwen2.5-coder:14b")
+    )
+    coding_default_tier: str = Field(
+        default_factory=lambda: _clamped_tier(os.getenv("JARVIS_CODING_DEFAULT_TIER", "small"))
     )
     # Scripts can run longer than a chat answer; still capped so a
     # runaway generation doesn't hang the background task indefinitely.

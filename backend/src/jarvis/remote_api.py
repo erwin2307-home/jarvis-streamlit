@@ -4,8 +4,9 @@ machine's LLM.
 
 Deliberately separate from app.py's voice-pipeline FastAPI app: this one
 exposes plain chat (HybridLlm, same routing/time-injection as the voice
-path) plus the BeadChip QA fast-path (qa_beadchip.py — exact-match
-answers + reagent lookup + broad topic-context injection for the LLM).
+path) plus the combined QA fast-path (qa_topics.py — BeadChip, NGS,
+Blutanalyse and Pharmakogenomik: exact-match answers + BeadChip's
+reagent lookup + broad topic-context injection for the LLM).
 No coding_handler (auto-runs generated scripts — would be remote code
 execution if exposed to the internet), no WebSocket, no mic/speaker/
 wake/VAD/STT/TTS.
@@ -40,8 +41,7 @@ from jarvis.llm import (
     load_groq_key,
     select_cloud_provider,
 )
-from jarvis.qa_beadchip import BEADCHIP_QA, beadchip_topic_context, reagent_answer
-from jarvis.qa_lookup import best_match
+from jarvis.qa_topics import fastpath_answer, topic_context as qa_topic_context
 from jarvis.stt import RealStt, Stt
 from jarvis.tts import EdgeTts, RealTts, Tts
 
@@ -303,13 +303,6 @@ def _check_key(x_api_key: str | None) -> None:
     raise HTTPException(status_code=401, detail="invalid or missing X-API-Key")
 
 
-def beadchip_fastpath_answer(text: str) -> str | None:
-    """Exact-match (curated question) or bare-reagent-abbreviation
-    BeadChip answer — checked before the LLM; a hit skips model
-    inference entirely, same reasoning as is_time_query/is_timer_query."""
-    return best_match(text, BEADCHIP_QA) or reagent_answer(text)
-
-
 # "Cool down" lab-protocol macro (30 min cooldown -> named wash/bath timers
 # -> instrument choice, each step voice-gated on "weiter") lives entirely
 # client-side in the Streamlit voice widget's JS — it has to, since that's
@@ -376,14 +369,14 @@ async def chat(
     if is_continue_query(req.message):
         return ChatResponse(reply="Weiter.")
 
-    beadchip_answer = beadchip_fastpath_answer(req.message)
-    if beadchip_answer is not None:
-        return ChatResponse(reply=beadchip_answer)
+    qa_answer = fastpath_answer(req.message)
+    if qa_answer is not None:
+        return ChatResponse(reply=qa_answer)
 
     messages = [*req.history, {"role": "user", "content": req.message}]
-    topic_context = beadchip_topic_context(req.message)
-    if topic_context:
-        messages = [{"role": "system", "content": topic_context}, *messages]
+    context = qa_topic_context(req.message)
+    if context:
+        messages = [{"role": "system", "content": context}, *messages]
 
     llm: Llm = app.state.llm
     full = ""
@@ -429,7 +422,7 @@ async def voice(
 
     timer_seconds: int | None = None
     timer_name: str | None = None
-    beadchip_answer = beadchip_fastpath_answer(transcript)
+    qa_answer = fastpath_answer(transcript)
     if is_time_query(transcript):
         full = time_answer()
     elif is_timer_query(transcript):
@@ -440,13 +433,13 @@ async def voice(
         full = "Cool-down gestartet. 30 Minuten."
     elif is_continue_query(transcript):
         full = "Weiter."
-    elif beadchip_answer is not None:
-        full = beadchip_answer
+    elif qa_answer is not None:
+        full = qa_answer
     else:
         messages = [{"role": "user", "content": transcript}]
-        topic_context = beadchip_topic_context(transcript)
-        if topic_context:
-            messages = [{"role": "system", "content": topic_context}, *messages]
+        context = qa_topic_context(transcript)
+        if context:
+            messages = [{"role": "system", "content": context}, *messages]
 
         llm: Llm = app.state.llm
         full = ""

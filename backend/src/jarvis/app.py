@@ -101,14 +101,17 @@ def create_app(start_orchestrator: bool = True) -> FastAPI:
         # Wire real orchestrator only when explicitly enabled. Tests use
         # start_orchestrator=False so heavy models never load.
         from jarvis.orchestrator import Orchestrator
-        from jarvis.qa_beadchip import BEADCHIP_QA, beadchip_topic_context
+        from jarvis.qa_topics import fastpath_answer, topic_context as qa_topic_context
         from jarvis.coding import (
+            decide_coding_action,
             extract_python_code,
-            is_coding_request,
+            new_id,
+            progress_path_for,
             run_script_in_new_window,
+            save_launcher,
             save_script,
+            write_progress,
         )
-        from jarvis.qa_lookup import best_match
         from jarvis.audio_io import RealMicStream, RealSpeaker
         from jarvis.wake import RealWakeWord
         from jarvis.vad import RealVad
@@ -172,32 +175,59 @@ def create_app(start_orchestrator: bool = True) -> FastAPI:
                 max_tokens=settings.reaction_max_tokens,
             )
 
-            # Dedicated small coding model — separate Ollama model load
-            # from the voice-response path, so a code-generation request
-            # doesn't change what model answers normal questions.
-            coding_llm: Llm = RealLlm(
-                host=settings.llm_host,
-                model=settings.coding_model,
-                system_prompt=(
-                    "Du bist ein Python-Coding-Assistent. Antworte "
-                    "AUSSCHLIESSLICH mit einem vollständigen, lauffähigen "
-                    "Python-Skript in einem einzigen ```python ... ``` "
-                    "Codeblock. Kein Fließtext davor oder danach. Nutze "
-                    "für grafische Oberflächen tkinter (Standardbibliothek)."
-                ),
-                timeout_s=settings.llm_timeout_s,
-                max_tokens=settings.coding_max_tokens,
+            # Three separate Ollama model loads (small/medium/large), not
+            # one — a code-generation request starts on the fast "small"
+            # tier and only loads a bigger one if the upgrade trigger
+            # actually fires, so most requests never pay for anything
+            # bigger than coding_model_small.
+            _CODING_SYSTEM_PROMPT = (
+                "Du bist ein Python-Coding-Assistent. Antworte "
+                "AUSSCHLIESSLICH mit einem vollständigen, lauffähigen "
+                "Python-Skript in einem einzigen ```python ... ``` "
+                "Codeblock. Kein Fließtext davor oder danach. Nutze "
+                "für grafische Oberflächen tkinter (Standardbibliothek)."
             )
+            coding_models = {
+                "small": settings.coding_model_small,
+                "medium": settings.coding_model_medium,
+                "large": settings.coding_model,
+            }
+            coding_llms: dict[str, Llm] = {
+                tier: RealLlm(
+                    host=settings.llm_host,
+                    model=model_name,
+                    system_prompt=_CODING_SYSTEM_PROMPT,
+                    timeout_s=settings.llm_timeout_s,
+                    max_tokens=settings.coding_max_tokens,
+                )
+                for tier, model_name in coding_models.items()
+            }
+            # Mutable across calls within this orchestrator's lifetime —
+            # tracks the tier + prompt text so an upgrade trigger
+            # ("größeres Modell") knows what to re-run and at what tier.
+            # Reset to coding_default_tier on every NEW coding request;
+            # only the upgrade trigger bumps it, and only for a re-run of
+            # that same last request.
+            coding_state: dict[str, str | None] = {
+                "tier": settings.coding_default_tier,
+                "last_prompt": None,
+            }
 
-            def handle_coding_request(text: str) -> bool:
-                """Returns True (and has already fired a detached
-                background task) if this transcript is a code-generation
-                request; False otherwise, so the caller falls through to
-                the normal QA/LLM path. Generation + execution happen in
-                a task that outlives this turn — intentionally not
-                awaited here."""
-                if not is_coding_request(text):
-                    return False
+            def _dispatch_coding(text: str, tier: str) -> None:
+                model_name = coding_models[tier]
+                coding_llm = coding_llms[tier]
+                script_id = new_id()
+                progress_path = progress_path_for(script_id, settings.coding_scripts_dir)
+                write_progress(
+                    progress_path,
+                    status="generating",
+                    tokens=0,
+                    max_tokens=settings.coding_max_tokens,
+                    model=model_name,
+                )
+                launcher_path = save_launcher(progress_path, settings.coding_scripts_dir, script_id)
+                pid = run_script_in_new_window(launcher_path)
+                logger.info(f"coding: launcher started (pid {pid}, tier={tier}, model={model_name})")
 
                 async def _generate_and_run() -> None:
                     try:
@@ -205,6 +235,16 @@ def create_app(start_orchestrator: bool = True) -> FastAPI:
                         async for ev in coding_llm.chat([{"role": "user", "content": text}]):
                             if ev.kind == "chunk":
                                 full += ev.text
+                                # chars/4 ~= tokens: a rough estimate for the
+                                # progress bar, not an exact token count —
+                                # Ollama's stream only gives text chunks.
+                                write_progress(
+                                    progress_path,
+                                    status="generating",
+                                    tokens=len(full) // 4,
+                                    max_tokens=settings.coding_max_tokens,
+                                    model=model_name,
+                                )
                             elif ev.kind == "done":
                                 full = ev.text or full
                         code = extract_python_code(full)
@@ -212,14 +252,46 @@ def create_app(start_orchestrator: bool = True) -> FastAPI:
                             logger.warning(
                                 f"coding: model produced no code block for {text!r}"
                             )
+                            write_progress(
+                                progress_path,
+                                status="error",
+                                error="Kein gültiger Code-Block erkannt.",
+                            )
                             return
                         path = save_script(code, settings.coding_scripts_dir)
-                        pid = run_script_in_new_window(path)
-                        logger.info(f"coding: ran {path} (pid {pid})")
+                        write_progress(progress_path, status="done", script_path=str(path))
+                        logger.info(f"coding: generated {path} (tier={tier})")
                     except Exception as exc:
                         logger.warning(f"coding: background task failed (ignored): {exc!r}")
+                        write_progress(progress_path, status="error", error=str(exc))
 
                 asyncio.create_task(_generate_and_run())
+
+            def handle_coding_request(text: str) -> bool:
+                """Returns True (and has already fired a detached
+                background task) if this transcript is a code-generation
+                request OR an upgrade-tier request for the last one;
+                False otherwise, so the caller falls through to the
+                normal QA/LLM path. Generation + execution happen in a
+                task that outlives this turn — intentionally not awaited
+                here."""
+                last_prompt = coding_state["last_prompt"]
+                decision = decide_coding_action(
+                    text,
+                    str(coding_state["tier"]),
+                    last_prompt if isinstance(last_prompt, str) else None,
+                    str(settings.coding_default_tier),
+                )
+                if decision is None:
+                    return False
+                prompt, tier = decision
+                coding_state["tier"] = tier
+                coding_state["last_prompt"] = prompt
+                try:
+                    _dispatch_coding(prompt, tier)
+                except Exception as exc:
+                    logger.warning(f"coding: dispatch prelude failed, falling through: {exc!r}")
+                    return False
                 return True
 
             # Pre-warm: tell Ollama to load the model into RAM now. First real
@@ -320,8 +392,8 @@ def create_app(start_orchestrator: bool = True) -> FastAPI:
                     fast_llm=reaction_llm if cloud_llm is not None else None,
                     complexity_threshold=settings.complexity_threshold,
                     max_listen_s=settings.max_listen_s,
-                    qa_matcher=lambda t: best_match(t, BEADCHIP_QA),
-                    topic_context=beadchip_topic_context,
+                    qa_matcher=fastpath_answer,
+                    topic_context=qa_topic_context,
                     coding_handler=handle_coding_request,
                 )
 
