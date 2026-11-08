@@ -16,13 +16,40 @@ a generation "done" — a cheap real-world catch for exactly the class of
 bug that shipped in practice (a canvas-size/block-size mismatch that
 threw on the very first line, so the "finished" game never did anything
 at all; see remote_api.py's _run_smoke_check for how it's invoked and
-escalated on failure). This is NOT the same trust model as coding.py's
-fast-path: it runs in a Node `vm` context with no `require`/`process`/
-filesystem access (only the minimal document/canvas/timer stubs below),
-as its own short-lived subprocess with a timeout — a genuine sandbox,
-not "trust the model and run it with real privileges." It only ever
-proves the game didn't crash on load / a few ticks of its own loop, not
-that it's fun, balanced, or bug-free in ways that need actual input.
+escalated on failure).
+
+Be clear about what this buys and doesn't: Node's `vm` module is
+explicitly documented by Node itself as NOT a security mechanism, and
+that's been proven true here across three rounds of security review,
+not just a theoretical caveat — confirmed live: (1) an earlier version
+passed real host objects (console, Math, ...) into the sandboxed
+context, and `console.constructor.constructor("return process")()`
+reached the real host `process` and exited the actual node process
+with a chosen code; fixed by building every stub from source text run
+*inside* a context created with nothing injected at all. (2) A second,
+narrower vector survived that fix: a BARE top-level `this` in a
+non-strict script run via `vm.runInContext` is still the context's own
+global object, and `this.constructor.constructor("return process")()`
+*still* reaches the host `process` — this is true even with
+`vm.createContext()` given no argument object, and Node's own
+documented stop-gap (`Object.setPrototypeOf(globalThis, null)`) was
+tested here and does NOT block it; forcing strict mode on the
+generated script doesn't help either (top-level `this` is the global
+object in strict mode too, strict mode only changes `this` for
+ordinary function calls without a receiver — verified, not assumed).
+
+This residual gap is accepted, deliberately, for one concrete reason:
+the text sent to the model (`game_prompt()` below) is a FIXED, server-
+controlled constant — `/games/{game}/generate` takes no free-form
+input from its caller, only a game id from a closed set of 4. A caller
+cannot inject prompt content to coax the model toward writing escape
+code; the only thing that varies is the model's own, non-adversarial
+completion of a fixed "write me a canvas game" request. If this
+pipeline is ever changed to accept caller-supplied prompt text, or to
+run a model whose output isn't trusted this way, this smoke-check
+would need real OS-level isolation (a container with no network and a
+read-only filesystem, or `isolated-vm`'s separate V8 isolate) instead
+of `vm` — do not treat the current hardening as sufficient for that.
 
 Each game is requested as ONE complete, offline, self-contained HTML
 document (inline <style>/<script>, no CDN/network calls — this project
@@ -152,31 +179,24 @@ def extract_script_body(html: str) -> str | None:
 # backslashes, template literals) without breaking the harness around
 # it.
 #
-# IMPORTANT: Node's `vm` module is explicitly NOT a security boundary
-# (Node's own docs: "The vm module is not a security mechanism. Do not
-# use it to run untrusted code.") — an earlier version of this harness
-# passed real host objects (console, Math, Array, ...) into the
-# sandboxed context, which is the actual documented escape: any host
-# object's `.constructor.constructor` resolves back to the HOST
-# realm's Function constructor (e.g. generated code could have run
-# `console.constructor.constructor("return process")()` to reach the
-# real `process`, with real filesystem/network/process access). Fixed
-# by creating a context with NO injected object graph at all
-# (`vm.createContext()`, no argument) and defining every stub —
-# document, window, setTimeout, console, etc. — from source TEXT run
-# inside that context (the `_BOOTSTRAP` script below), so nothing the
-# generated script can reach has a prototype chain leading back to
-# this (host) realm. This closes the specific named escape; it is
-# still "best-effort hardening" per Node's own caveat, not an absolute
-# guarantee against a sufficiently creative escape — if this pipeline
-# ever needs to run genuinely adversarial, untrusted input (it
-# currently only runs this project's own local Ollama model's output),
-# a real OS-level sandbox (container/VM, no network, read-only FS)
-# would be the correct upgrade. `setTimeout`/`requestAnimationFrame`
-# queue callbacks instead of actually scheduling them; a second,
-# separate run drains a bounded number of them to exercise a few ticks
-# of the game's own loop, which is what actually catches a bug that
-# only shows up once gameplay starts (not just at parse time).
+# IMPORTANT — see the module docstring above for the full, verified
+# history: Node's `vm` is NOT a security boundary (Node's own docs say
+# so explicitly). Building every stub from source text run inside a
+# context created with nothing injected (below) closes the escape via
+# an injected host object's `.constructor.constructor` (proven exploitable
+# before this fix, proven blocked after). It does NOT close every vm
+# escape — a bare top-level `this` in the generated script still
+# reaches the context's global object and from there the host process
+# (proven, including against Node's own suggested stop-gap and against
+# forcing strict mode on the generated script — neither helped). That
+# residual gap is accepted deliberately because the text sent to the
+# model is a fixed, server-controlled constant, never caller-supplied —
+# see the module docstring before changing that assumption.
+# `setTimeout`/`requestAnimationFrame` queue callbacks instead of
+# actually scheduling them; a second, separate run drains a bounded
+# number of them to exercise a few ticks of the game's own loop, which
+# is what actually catches a bug that only shows up once gameplay
+# starts (not just at parse time).
 _BOOTSTRAP = """
 function makeStubElement() {
   var ctx2d = {

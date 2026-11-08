@@ -243,3 +243,35 @@ def test_smoke_check_sandbox_blocks_the_exact_proven_console_escape(tmp_path) ->
     assert result.returncode != 42, "escape succeeded — reached and called host process.exit"
     assert result.returncode != 0
     assert "SMOKE_FAIL" in result.stderr
+
+
+@_requires_node
+def test_smoke_check_sandbox_has_a_known_accepted_gap_via_bare_this(tmp_path) -> None:
+    """Documents, deliberately, a limitation this project accepts rather
+    than denies: unlike the console/constructor-chain escape above (which
+    IS blocked), a bare top-level `this` in a non-strict script run via
+    vm.runInContext still resolves to the context's own global object
+    and from there reaches the host `process` — proven here, and proven
+    to survive both Node's own suggested stop-gap
+    (Object.setPrototypeOf(globalThis, null)) and forcing strict mode on
+    the generated script (verified empirically, not assumed from the
+    spec — top-level `this` is the global object in strict mode too).
+
+    This is accepted, not fixed, because games.py's GAME_PROMPTS are
+    fixed server-side constants — no caller can inject prompt content
+    toward writing escape-shaped code, only ask for one of 4 named
+    games. If this test ever starts failing (i.e. this specific escape
+    gets blocked by a future Node version or a real fix), that's a
+    welcome improvement, not a regression — update this test's
+    docstring rather than deleting it blindly, so the module docstring's
+    "verified, not assumed" history stays accurate.
+    """
+    script = 'this.constructor.constructor("return process")().exit(66);'
+    harness_path = tmp_path / "harness.js"
+    harness_path.write_text(build_smoke_harness(script), encoding="utf-8")
+    result = subprocess.run(["node", str(harness_path)], capture_output=True, text=True, timeout=15)
+    assert result.returncode == 66, (
+        "expected the known, accepted escape to still succeed here — if "
+        "it was blocked instead, that's great, but go update this test "
+        "and the module docstring's security history to match reality"
+    )
