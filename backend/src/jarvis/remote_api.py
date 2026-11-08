@@ -687,6 +687,12 @@ async def generate_game(game: str, x_api_key: str | None = Header(default=None))
     _check_key(x_api_key)
     if game not in GAME_IDS:
         raise HTTPException(status_code=404, detail=f"unknown game {game!r}")
+    if _game_html_path(game).exists():
+        # Already generated — serve the existing file, never silently
+        # regenerate (and overwrite) just because the button was
+        # clicked again. Games are meant to feel pre-made and instantly
+        # playable, not rebuilt from scratch on every click.
+        return {"status": "done"}
     if game in app.state.game_in_flight:
         return {"status": "generating"}  # already in flight — don't double-dispatch
     app.state.game_in_flight.add(game)  # no `await` since the check above — atomic
@@ -699,9 +705,13 @@ async def game_status(game: str, x_api_key: str | None = Header(default=None)) -
     _check_key(x_api_key)
     if game not in GAME_IDS:
         raise HTTPException(status_code=404, detail=f"unknown game {game!r}")
-    progress = _read_progress(game)
-    if progress.get("status") == "done" or (not progress and _game_html_path(game).exists()):
+    if _game_html_path(game).exists():
+        # The file's existence always wins, even over a stale
+        # "generating" progress record left behind by an abandoned or
+        # crashed earlier attempt — otherwise a finished game can get
+        # stuck reporting "generating" forever.
         return {"status": "done"}
+    progress = _read_progress(game)
     if progress:
         return progress
     return {"status": "idle"}

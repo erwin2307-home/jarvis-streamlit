@@ -537,6 +537,28 @@ def test_generate_game_returns_generating_immediately(client, monkeypatch, tmp_p
     assert resp.json()["status"] == "generating"
 
 
+def test_generate_game_returns_done_without_regenerating_if_already_built(
+    client, monkeypatch, tmp_path
+):
+    """Games are meant to feel pre-made — a click shouldn't silently
+    rebuild (and overwrite) an already-finished game."""
+    from jarvis import remote_api
+    from jarvis.llm import FakeLlm
+
+    monkeypatch.setattr(remote_api.settings, "games_dir", tmp_path)
+    tmp_path.mkdir(exist_ok=True)
+    (tmp_path / "tetris.html").write_text(_VALID_GAME_HTML, encoding="utf-8")
+    client.app.state.game_llm = FakeLlm([])
+    resp = client.post("/games/tetris/generate", headers={"X-API-Key": "test-secret"})
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "done"
+    assert (tmp_path / "tetris.html").read_text(encoding="utf-8") == _VALID_GAME_HTML
+    # Proves the create_task/in_flight branch was never reached at all,
+    # not just that the (possibly-not-yet-run) task hasn't written
+    # anything yet.
+    assert "tetris" not in remote_api.app.state.game_in_flight
+
+
 async def test_generate_game_writes_html_on_success(monkeypatch, tmp_path):
     from jarvis import remote_api
     from jarvis.llm import FakeLlm
@@ -653,6 +675,32 @@ def test_game_status_is_done_when_html_already_exists(client, monkeypatch, tmp_p
 
     monkeypatch.setattr(remote_api.settings, "games_dir", tmp_path)
     tmp_path.mkdir(exist_ok=True)
+    (tmp_path / "pacman.html").write_text(_VALID_GAME_HTML, encoding="utf-8")
+    resp = client.get("/games/pacman/status", headers={"X-API-Key": "test-secret"})
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "done"
+
+
+def test_game_status_is_done_even_with_a_stale_generating_progress_file(
+    client, monkeypatch, tmp_path
+):
+    """Regression: an abandoned/crashed earlier attempt can leave a
+    progress file stuck on status=generating. Once the html file
+    actually exists (e.g. it finished anyway, or was placed there
+    directly), status must report "done", not get stuck replaying the
+    stale record forever."""
+    from jarvis import remote_api
+    from jarvis.coding import write_progress
+
+    monkeypatch.setattr(remote_api.settings, "games_dir", tmp_path)
+    tmp_path.mkdir(exist_ok=True)
+    write_progress(
+        remote_api._game_progress_path("pacman"),
+        status="generating",
+        tokens=0,
+        max_tokens=8000,
+        model="qwen2.5-coder:14b",
+    )
     (tmp_path / "pacman.html").write_text(_VALID_GAME_HTML, encoding="utf-8")
     resp = client.get("/games/pacman/status", headers={"X-API-Key": "test-secret"})
     assert resp.status_code == 200
