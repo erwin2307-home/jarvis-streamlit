@@ -207,9 +207,25 @@ VOICE_WIDGET_HTML = r"""
       cursor: pointer;
     }
     #cooldown-continue { display: none; }
+    /* Same pill size as #talk-btn (14px/36px padding, 15px font) — only
+       the gradient colors differ, so each big button reads as equally
+       "primary" rather than talk-btn looking like the only real action. */
+    #cooldown-manual-btn, #games-btn {
+      border: none; border-radius: 999px; padding: 14px 36px;
+      font-size: 15px; font-weight: 600; color: #05070c; cursor: pointer;
+    }
     #cooldown-manual-btn {
-      border: 1px solid #ffb020; border-radius: 999px; padding: 6px 18px;
-      font-size: 12px; font-weight: 600; color: #ffb020; background: transparent;
+      background: linear-gradient(180deg, #ffd270, #ffb020);
+      box-shadow: 0 0 18px #ffb02088, 0 2px 0 #a86f0c inset;
+    }
+    #games-btn {
+      background: linear-gradient(180deg, #d9b3ff, #b388ff);
+      box-shadow: 0 0 18px #b388ff88, 0 2px 0 #6b4fa8 inset;
+    }
+    #games-choice { display: none; gap: 10px; }
+    #games-choice button {
+      border: 1px solid #b388ff; border-radius: 999px; padding: 8px 20px;
+      font-size: 13px; font-weight: 600; color: #b388ff; background: transparent;
       cursor: pointer;
     }
   </style>
@@ -219,6 +235,11 @@ VOICE_WIDGET_HTML = r"""
   </div>
   <button id="talk-btn" type="button">🎤 Gedrückt halten zum Sprechen</button>
   <button id="cooldown-manual-btn" type="button">❄️ Cool Down</button>
+  <button id="games-btn" type="button">🎮 Spiele</button>
+  <div id="games-choice">
+    <button id="game-tetris" type="button">Tetris</button>
+    <button id="game-pacman" type="button">Pac-Man</button>
+  </div>
   <div id="timers"></div>
   <div id="status-line">Button oder Leertaste (Ring anklicken) halten zum Sprechen</div>
   <div id="hint-line"></div>
@@ -241,6 +262,10 @@ VOICE_WIDGET_HTML = r"""
     const transcriptEl = document.getElementById("transcript");
     const talkBtn = document.getElementById("talk-btn");
     const cooldownManualBtn = document.getElementById("cooldown-manual-btn");
+    const gamesBtn = document.getElementById("games-btn");
+    const gamesChoiceEl = document.getElementById("games-choice");
+    const gameTetrisBtn = document.getElementById("game-tetris");
+    const gamePacmanBtn = document.getElementById("game-pacman");
     const playFallback = document.getElementById("play-fallback");
     const timersEl = document.getElementById("timers");
     const hintLine = document.getElementById("hint-line");
@@ -420,6 +445,17 @@ VOICE_WIDGET_HTML = r"""
     choiceBioroboterBtn.addEventListener("click", () => startInstrumentTimer("Timer Bioroboter", 2 * 3600 + 55 * 60));
     continueBtn.addEventListener("click", () => handleCooldownContinue());
     cooldownManualBtn.addEventListener("click", () => startCooldown());
+    gamesBtn.addEventListener("click", () => {
+      gamesChoiceEl.style.display = gamesChoiceEl.style.display === "flex" ? "none" : "flex";
+    });
+    // Tetris/Pac-Man generation backend not built yet — placeholder so
+    // the button isn't a silent dead click while that's decided.
+    gameTetrisBtn.addEventListener("click", () => {
+      cooldownHint("Tetris kommt noch — Generierung ist noch nicht angebunden.");
+    });
+    gamePacmanBtn.addEventListener("click", () => {
+      cooldownHint("Pac-Man kommt noch — Generierung ist noch nicht angebunden.");
+    });
 
     function handleCooldownContinue() {
       if (!cooldown || !cooldown.waitingForContinue) return;
@@ -610,6 +646,12 @@ VOICE_WIDGET_HTML = r"""
     // against both firing at once.
     talkBtn.addEventListener("pointerdown", (e) => {
       e.preventDefault();
+      // Captures the pointer so pointerleave/pointerout don't fire while
+      // held — without this, a finger/cursor drifting off the rounded
+      // button's edge mid-press (very easy on the pill shape) fired
+      // pointerleave and stopped recording early, jumping straight to
+      // "thinking" while the user was still mid-sentence.
+      try { talkBtn.setPointerCapture(e.pointerId); } catch (err) { /* unsupported — pointerleave fallback below still applies */ }
       startRecording();
     });
     talkBtn.addEventListener("pointerup", (e) => {
@@ -621,6 +663,9 @@ VOICE_WIDGET_HTML = r"""
       stopRecordingAndSend();
     });
     talkBtn.addEventListener("pointerleave", (e) => {
+      // With setPointerCapture above, this should no longer fire while
+      // actually pressed — kept as a defensive fallback for a browser
+      // that ignores capture, guarded the same way it always was.
       if (isActive) stopRecordingAndSend();
     });
     // Prevent context menu / long-press callout from interrupting on mobile.
@@ -639,7 +684,10 @@ def render_voice_widget(api_url: str, voice_token: str) -> None:
     html = VOICE_WIDGET_HTML.replace("__API_URL__", api_url.replace('"', "")).replace(
         "__API_KEY__", voice_token.replace('"', "")
     )
-    components.html(html, height=380)
+    # 500, not 380 — Cool Down + Spiele buttons added below talk-btn
+    # pushed the flex column taller; components.html doesn't auto-size
+    # or scroll, so anything past the fixed height gets silently clipped.
+    components.html(html, height=500)
 
 
 # API_KEY and API_URL come ONLY from st.secrets — never from a widget.
