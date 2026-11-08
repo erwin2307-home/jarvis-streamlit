@@ -239,11 +239,19 @@ class Settings(BaseModel):
     # a real bug shipped in practice (canvas-size/block-size mismatch
     # throwing on load) that this would have caught automatically. On a
     # smoke-check failure, ONE escalation attempt is made with a bigger
-    # model before giving up — not the default, only a failure fallback,
-    # since this machine already OOM-killed qwen2.5-coder:32b twice
-    # under normal load (see coding_model's comment above).
+    # model before giving up — not the default, only a failure fallback.
+    # qwen2.5-coder:32b at its default Q4_K_M quant (~19.85GB) already
+    # OOM-killed this machine twice before this pipeline existed, and
+    # then failed again live during this pipeline's own first real
+    # escalation (free RAM dropped to ~5GB, Ollama lost the connection
+    # mid-stream and unloaded the model: `generation_failed`, not a full
+    # crash, but still a wasted ~15 minutes). Switched to the q3_K_M
+    # quant (~15GB on disk) — same parameter count, more aggressively
+    # quantized, meaningfully less RAM pressure at some quality cost.
     game_model_xlarge: str = Field(
-        default_factory=lambda: os.getenv("JARVIS_GAME_MODEL_XLARGE", "qwen2.5-coder:32b")
+        default_factory=lambda: os.getenv(
+            "JARVIS_GAME_MODEL_XLARGE", "qwen2.5-coder:32b-instruct-q3_K_M"
+        )
     )
     game_smoke_timeout_s: float = Field(
         default_factory=lambda: float(os.getenv("JARVIS_GAME_SMOKE_TIMEOUT_S", "15.0"))
